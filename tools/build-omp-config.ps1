@@ -1,0 +1,673 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+  Generate an Oh-My-Posh config that renders coralline's statusline.
+
+.DESCRIPTION
+  Reads coralline.conf with coralline's own parser, extracted live from
+  statusline.ps1 through the PowerShell AST, so the generator and the native
+  renderer can never disagree about what a config means. The resolved settings
+  are then written out as an Oh-My-Posh config for `oh-my-posh claude --config`.
+
+  Supported: styles pill, lean and classic; the bundled themes and every
+  VL_BG_* / VL_FG_* override; the fixed layout with VL_SEGMENTS, VL_SEGMENTS2 and
+  VL_SEGMENTS3; gauge thresholds, bar width and glyphs; VL_ASCII; path depth;
+  name truncation; cost decimals; clock modes; the *_ALWAYS_SHOW switches; and the
+  segments dir, project, git, stash, node, python, model, effort, ctx, limit5h,
+  limit7d, lines, cost, style, duration and clock. Other segment names are skipped
+  with a warning.
+
+  The output is pure ASCII JSON with LF line endings, identical under Windows
+  PowerShell 5.1 and PowerShell 7.
+
+.PARAMETER ConfigPath
+  coralline.conf to read. Defaults to $env:CORALLINE_CONFIG, then
+  ~/.claude/coralline.conf, the same order the native renderer uses.
+
+.PARAMETER StatuslinePath
+  statusline.ps1 supplying the config parser and defaults. Its folder's themes
+  directory is the approved include root, as at runtime.
+
+.PARAMETER OutFile
+  Where the Oh-My-Posh config is written. Prints to stdout when omitted.
+
+.EXAMPLE
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build-omp-config.ps1 -OutFile "$HOME\.claude\coralline\coralline.omp.json"
+
+.EXAMPLE
+  pwsh -NoProfile -File .\tools\build-omp-config.ps1 -ConfigPath .\my.conf
+#>
+param(
+    [string]$ConfigPath = '',
+    [string]$StatuslinePath = '',
+    [string]$OutFile = ''
+)
+
+$ErrorActionPreference = 'Stop'
+$Here = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
+if ([string]::IsNullOrEmpty($StatuslinePath)) { $StatuslinePath = Join-Path (Split-Path -Path $Here -Parent) 'statusline.ps1' }
+$StatuslinePath = [System.IO.Path]::GetFullPath($StatuslinePath)
+$ScriptDir = [System.IO.Path]::GetDirectoryName($StatuslinePath)
+$Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+$IntegerStyle = [System.Globalization.NumberStyles]::Integer
+$FloatStyle = [System.Globalization.NumberStyles]::Float
+$StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+# ---- 1. coralline's own parser and defaults, extracted from statusline.ps1 ------
+$parseTokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($StatuslinePath, [ref]$parseTokens, [ref]$parseErrors)
+if ($parseErrors.Count -ne 0) { throw ('statusline.ps1 does not parse: ' + $parseErrors[0].Message) }
+$helperNames = @('Glyph', 'Remove-ControlChars', 'Copy-Config', 'Add-Utf8Text', 'Read-WordChar', 'Decode-ShellWord',
+    'Test-DosDeviceComponent', 'Test-LocalPathSyntax', 'ConvertTo-LocalFullPath', 'Test-PathInside',
+    'Test-NoReparseComponents', 'Test-SafeRegularFile', 'Read-StrictUtf8File', 'Import-ConfigFile',
+    'Get-BoundedInt', 'Test-Color')
+$helpers = $ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $helperNames -contains $node.Name
+    }, $false)
+foreach ($definition in $helpers) { . ([scriptblock]::Create($definition.Extent.Text)) }
+foreach ($name in $helperNames) {
+    if (-not (Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue)) { throw ('statusline.ps1 no longer defines ' + $name) }
+}
+$defaultsAst = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -ceq '$Defaults'
+    }, $false)
+if ($null -eq $defaultsAst) { throw 'statusline.ps1 no longer assigns $Defaults' }
+# $Defaults references these paths; their values do not matter to the generator.
+$DefaultFloatFile = ''
+$DefaultBurnFile = ''
+$DefaultRl5File = ''
+$DefaultRl7File = ''
+. ([scriptblock]::Create($defaultsAst.Extent.Text))
+$PathConfigKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+foreach ($key in @('VL_FLOAT_FILE', 'BURN_FILE', 'RL5H_FILE', 'RL7D_FILE')) { [void]$PathConfigKeys.Add($key) }
+$ConfigKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+foreach ($key in $Defaults.Keys) { [void]$ConfigKeys.Add([string]$key) }
+
+# ---- 2. Load the config exactly as statusline.ps1 does ----------------------------
+$Cfg = Copy-Config $Defaults
+$ConfigAssignments = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+$ConfigInput = $ConfigPath
+if ([string]::IsNullOrEmpty($ConfigInput)) { $ConfigInput = [string]$env:CORALLINE_CONFIG }
+if ([string]::IsNullOrEmpty($ConfigInput)) { $ConfigInput = [System.IO.Path]::Combine([string]$HOME, '.claude\coralline.conf') }
+$resolvedConfig = ConvertTo-LocalFullPath $ConfigInput ([Environment]::CurrentDirectory)
+$configLoaded = $false
+if (-not [string]::IsNullOrEmpty($resolvedConfig) -and [System.IO.File]::Exists($resolvedConfig)) {
+    $approved = @([System.IO.Path]::GetDirectoryName($resolvedConfig))
+    $themesRoot = ConvertTo-LocalFullPath ([System.IO.Path]::Combine($ScriptDir, 'themes')) $ScriptDir
+    if (-not [string]::IsNullOrEmpty($themesRoot)) { $approved += $themesRoot }
+    $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $parsed = Import-ConfigFile $resolvedConfig $Cfg $ConfigAssignments @{ IncludeCount = 0; Visited = $visited } 0 $approved
+    if ($parsed.Success) {
+        $Cfg = $parsed.Config
+        $ConfigAssignments = $parsed.Assignments
+        $configLoaded = $true
+    } else {
+        [Console]::Error.WriteLine('warning: ' + $resolvedConfig + ' was rejected by the coralline parser; using defaults')
+    }
+}
+foreach ($key in @($Cfg.Keys)) { $Cfg[$key] = Remove-ControlChars ([string]$Cfg[$key]) }
+
+# ---- 3. Normalisation, in statusline.ps1's order -----------------------------------
+$Cfg.VL_BAR_WIDTH = [string](Get-BoundedInt $Cfg.VL_BAR_WIDTH ([int]$Defaults.VL_BAR_WIDTH) 0 64)
+$Cfg.VL_PATH_DEPTH = [string](Get-BoundedInt $Cfg.VL_PATH_DEPTH ([int]$Defaults.VL_PATH_DEPTH) 1 256)
+$Cfg.VL_NAME_MAX = [string](Get-BoundedInt $Cfg.VL_NAME_MAX ([int]$Defaults.VL_NAME_MAX) 0 4096)
+$Cfg.VL_COST_DECIMALS = [string](Get-BoundedInt $Cfg.VL_COST_DECIMALS ([int]$Defaults.VL_COST_DECIMALS) 0 9)
+$Cfg.VL_WARN_PCT = [string](Get-BoundedInt $Cfg.VL_WARN_PCT ([int]$Defaults.VL_WARN_PCT) 0 100)
+$Cfg.VL_HOT_PCT = [string](Get-BoundedInt $Cfg.VL_HOT_PCT ([int]$Defaults.VL_HOT_PCT) 0 100)
+if ([int]$Cfg.VL_HOT_PCT -lt [int]$Cfg.VL_WARN_PCT) {
+    $Cfg.VL_WARN_PCT = $Defaults.VL_WARN_PCT
+    $Cfg.VL_HOT_PCT = $Defaults.VL_HOT_PCT
+}
+foreach ($key in @($Cfg.Keys | Where-Object { $_ -like 'VL_BG_*' -or $_ -like 'VL_FG_*' })) {
+    if (-not (Test-Color $Cfg[$key])) { $Cfg[$key] = $Defaults[$key] }
+}
+if (-not (Test-Color $Cfg.VL_LEAN_BG)) { $Cfg.VL_LEAN_BG = '' }
+if (-not (Test-Color $Cfg.VL_LEAN_FG)) { $Cfg.VL_LEAN_FG = '' }
+$Cfg.VL_STYLE = switch -CaseSensitive ([string]$Cfg.VL_STYLE) {
+    'pill' { 'pill'; break }
+    'lean' { 'lean'; break }
+    'classic' { 'classic'; break }
+    default { 'pill' }
+}
+$Cfg.VL_LAYOUT = switch -CaseSensitive ([string]$Cfg.VL_LAYOUT) {
+    'fixed' { 'fixed'; break }
+    'auto' { 'auto'; break }
+    default { 'fixed' }
+}
+if ($Cfg.VL_ASCII -eq '1') {
+    $Cfg.VL_CAP_L = ''
+    $Cfg.VL_CAP_R = ''
+    $Cfg.VL_SEP = ''
+    $Cfg.VL_BAR_FILL = '#'
+    $Cfg.VL_BAR_EMPTY = '-'
+    $Cfg.VL_NODE_GLYPH = 'node'
+    $Cfg.VL_PY_GLYPH = 'py'
+}
+if ($Cfg.VL_STYLE -eq 'classic') {
+    $Cfg.VL_STYLE = 'lean'
+    if ([string]::IsNullOrEmpty($Cfg.VL_LEAN_BG)) {
+        $Cfg.VL_LEAN_BG = $Cfg.VL_BG_BAR
+        if ([string]::IsNullOrEmpty($Cfg.VL_LEAN_BG)) { $Cfg.VL_LEAN_BG = '238' }
+    }
+    if ([string]::IsNullOrEmpty($Cfg.VL_LEAN_CAP_R)) { $Cfg.VL_LEAN_CAP_R = $Cfg.VL_SEP }
+}
+if ($Cfg.VL_STYLE -eq 'lean') {
+    $Cfg.VL_CAP_L = ''
+    $Cfg.VL_CAP_R = ''
+    $Cfg.VL_FG_TEXT = $Cfg.VL_LEAN_FG
+}
+if ($Cfg.VL_LAYOUT -eq 'auto') {
+    [Console]::Error.WriteLine('warning: VL_LAYOUT=auto is not supported by the Oh-My-Posh engine yet; rendering VL_SEGMENTS as one fixed row')
+}
+
+# ---- 4. Oh-My-Posh building blocks --------------------------------------------------
+$Lean = $Cfg.VL_STYLE -eq 'lean'
+$G = @{
+    Branch = Glyph 0x2387; Diamond = Glyph 0x25C6; Flag = Glyph 0x2691; Dot = Glyph 0x2299; Pencil = Glyph 0x270E
+    Hourglass = Glyph 0x29D6; Psi = Glyph 0x03C8; Ahead = Glyph 0x21E1; Behind = Glyph 0x21E3; Ellipsis = Glyph 0x2026
+    Up = Glyph 0x2191; Down = Glyph 0x2193; Reset = Glyph 0x21BA
+}
+
+function ConvertTo-OmpColor {
+    <#
+    .SYNOPSIS
+      Translate a coralline colour spec (256-colour index or "R,G,B") to Oh-My-Posh.
+    .PARAMETER Spec
+      coralline colour spec; empty means no colour.
+    .EXAMPLE
+      ConvertTo-OmpColor -Spec '81,166,199'
+    #>
+    param([string]$Spec)
+    if ([string]::IsNullOrEmpty($Spec)) { return '' }
+    if ($Spec.Contains(',')) {
+        $parts = $Spec.Split(',')
+        return [string]::Format($Invariant, '#{0:x2}{1:x2}{2:x2}', [int]$parts[0], [int]$parts[1], [int]$parts[2])
+    }
+    return $Spec
+}
+
+function Protect-Markup {
+    <#
+    .SYNOPSIS
+      Escape a literal for use inside an Oh-My-Posh template string.
+    .DESCRIPTION
+      Literal glyphs from the config end up in Go template text; braces and angle
+      brackets would otherwise be read as template actions or colour markup.
+    .PARAMETER Text
+      Literal text.
+    .EXAMPLE
+      Protect-Markup -Text '<x>'
+    #>
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($ch in $Text.ToCharArray()) {
+        switch ($ch) {
+            '<' { [void]$builder.Append('{{ "<" }}'); break }
+            '>' { [void]$builder.Append('{{ ">" }}'); break }
+            '{' { [void]$builder.Append('{{ "{" }}'); break }
+            '}' { [void]$builder.Append('{{ "}" }}'); break }
+            default { [void]$builder.Append($ch) }
+        }
+    }
+    return $builder.ToString()
+}
+
+function Protect-Diamond {
+    <#
+    .SYNOPSIS
+      Escape a literal for an Oh-My-Posh diamond, which is markup but not a template.
+    .DESCRIPTION
+      Uses Oh-My-Posh's own chevron escape (template.EscapeText): "<" becomes "<<>"
+      and ">" becomes "<>>", so a cap or separator such as ">" is not read as colour
+      markup. Template-style escaping would print literally here.
+    .PARAMETER Text
+      Literal cap or separator.
+    .EXAMPLE
+      Protect-Diamond -Text '>'
+    #>
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($ch in $Text.ToCharArray()) {
+        switch ($ch) {
+            '<' { [void]$builder.Append('<<>'); break }
+            '>' { [void]$builder.Append('<>>'); break }
+            default { [void]$builder.Append($ch) }
+        }
+    }
+    return $builder.ToString()
+}
+
+function Get-ColorSpan {
+    <#
+    .SYNOPSIS
+      Wrap template text in a foreground colour, or return it unchanged for an empty colour.
+    .PARAMETER Color
+      Oh-My-Posh colour, or a template expression that yields one.
+    .PARAMETER Text
+      Template text.
+    .EXAMPLE
+      Get-ColorSpan -Color '245' -Text 'dim'
+    #>
+    param([string]$Color, [string]$Text)
+    if ([string]::IsNullOrEmpty($Color)) { return $Text }
+    return '<' + $Color + '>' + $Text + '</>'
+}
+
+function Get-TextSpan {
+    <#
+    .SYNOPSIS
+      Text coloured as coralline's ${fg}: the segment default in pill, VL_LEAN_FG in lean.
+    .PARAMETER Text
+      Template text.
+    .EXAMPLE
+      Get-TextSpan -Text ' x '
+    #>
+    param([string]$Text)
+    if ($Lean) { return (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_TEXT) $Text) }
+    return $Text
+}
+
+function Get-PctColorTemplate {
+    <#
+    .SYNOPSIS
+      Template expression choosing VL_FG_OK / WARN / HOT for a percentage variable.
+    .PARAMETER Variable
+      Template variable holding an integer percentage, such as '$p'.
+    .EXAMPLE
+      Get-PctColorTemplate -Variable '$p'
+    #>
+    param([string]$Variable)
+    return '{{ if ge ' + $Variable + ' ' + $Cfg.VL_HOT_PCT + ' }}' + (ConvertTo-OmpColor $Cfg.VL_FG_HOT) +
+        '{{ else if ge ' + $Variable + ' ' + $Cfg.VL_WARN_PCT + ' }}' + (ConvertTo-OmpColor $Cfg.VL_FG_WARN) +
+        '{{ else }}' + (ConvertTo-OmpColor $Cfg.VL_FG_OK) + '{{ end }}'
+}
+
+function Get-BarTemplate {
+    <#
+    .SYNOPSIS
+      Gauge of VL_BAR_WIDTH cells rounded like New-Bar: floor((pct * width + 50) / 100).
+    .PARAMETER Variable
+      Template variable holding an integer percentage clamped to 0..100.
+    .EXAMPLE
+      Get-BarTemplate -Variable '$p'
+    #>
+    param([string]$Variable)
+    $width = [int]$Cfg.VL_BAR_WIDTH
+    if ($width -le 0) { return '' }
+    return '{{ $f := div (add (mul ' + $Variable + ' ' + $width + ') 50) 100 }}{{ repeat $f "' + (Protect-Markup $Cfg.VL_BAR_FILL) +
+        '" }}{{ repeat (sub ' + $width + ' $f) "' + (Protect-Markup $Cfg.VL_BAR_EMPTY) + '" }}'
+}
+
+function Get-TokTemplate {
+    <#
+    .SYNOPSIS
+      Token count formatted like Format-Tok: 1.2M, 45.6k, truncated to one decimal.
+    .PARAMETER Expression
+      Template expression yielding a non-negative integer.
+    .EXAMPLE
+      Get-TokTemplate -Expression '.ContextWindow.TotalInputTokens'
+    #>
+    param([string]$Expression)
+    return '{{ $n := ' + $Expression + ' }}{{ if ge $n 1000000 }}{{ printf "%d.%dM" (div $n 1000000) (div (mod $n 1000000) 100000) }}' +
+        '{{ else if ge $n 1000 }}{{ printf "%d.%dk" (div $n 1000) (div (mod $n 1000) 100) }}{{ else }}{{ $n }}{{ end }}'
+}
+
+function Get-TruncTemplate {
+    <#
+    .SYNOPSIS
+      Name shortened like Get-Trunc to VL_NAME_MAX characters with a middle ellipsis.
+    .DESCRIPTION
+      Byte-based: exact for ASCII names, which covers branch and repository names.
+    .PARAMETER Expression
+      Template expression yielding the name.
+    .EXAMPLE
+      Get-TruncTemplate -Expression '.Ref'
+    #>
+    param([string]$Expression)
+    $max = [int]$Cfg.VL_NAME_MAX
+    if ($max -le 0) { return '{{ ' + $Expression + ' }}' }
+    $head = [int][Math]::Floor(($max - 1) / 2)
+    $tail = $max - 1 - $head
+    $short = '{{ substr 0 ' + $max + ' $t }}'
+    if ($max -ge 3) { $short = '{{ substr 0 ' + $head + ' $t }}' + $G.Ellipsis + '{{ substr (sub (len $t) ' + $tail + ') (len $t) $t }}' }
+    return '{{ $t := ' + $Expression + ' }}{{ if gt (len $t) ' + $max + ' }}' + $short + '{{ else }}{{ $t }}{{ end }}'
+}
+
+function Get-CountdownTemplate {
+    <#
+    .SYNOPSIS
+      Countdown formatted like Format-Countdown: 1d11h, 2h44m, 44m, or now.
+    .PARAMETER Expression
+      Template expression yielding the reset epoch.
+    .EXAMPLE
+      Get-CountdownTemplate -Expression '.RateLimits.FiveHour.ResetsAt'
+    #>
+    param([string]$Expression)
+    return '{{ $d := sub ' + $Expression + ' (now | unixEpoch) }}{{ if le $d 0 }}now' +
+        '{{ else if ge $d 86400 }}{{ printf "%dd%02dh" (div $d 86400) (div (mod $d 86400) 3600) }}' +
+        '{{ else if ge $d 3600 }}{{ printf "%dh%02dm" (div $d 3600) (div (mod $d 3600) 60) }}' +
+        '{{ else }}{{ printf "%dm" (div $d 60) }}{{ end }}'
+}
+
+function Get-BankersPctTemplate {
+    <#
+    .SYNOPSIS
+      Integer percentage from a float, clamped to 0..100 and rounded half to even like Get-PctValue.
+    .PARAMETER Expression
+      Template expression yielding the float (a pointer is dereferenced by addf).
+    .PARAMETER Variable
+      Template variable to assign.
+    .EXAMPLE
+      Get-BankersPctTemplate -Expression '.RateLimits.FiveHour.UsedPercentage' -Variable '$p'
+    #>
+    param([string]$Expression, [string]$Variable)
+    return '{{ $x := addf ' + $Expression + ' 0 }}{{ if lt $x 0.0 }}{{ $x = 0.0 }}{{ end }}{{ if gt $x 100.0 }}{{ $x = 100.0 }}{{ end }}' +
+        '{{ $fl := floor $x }}{{ $fr := subf $x $fl }}{{ ' + $Variable + ' := int $fl }}' +
+        '{{ if gt $fr 0.5 }}{{ ' + $Variable + ' = add ' + $Variable + ' 1 }}{{ else if eq $fr 0.5 }}{{ if eq (mod ' + $Variable + ' 2) 1 }}{{ ' + $Variable + ' = add ' + $Variable + ' 1 }}{{ end }}{{ end }}'
+}
+
+function Get-PathTemplate {
+    <#
+    .SYNOPSIS
+      Current directory collapsed like Get-DisplayPath: ~ for home, first/.../last beyond VL_PATH_DEPTH.
+    .EXAMPLE
+      Get-PathTemplate
+    #>
+    # No {{- -}} trim markers: they would also eat the literal spaces the caller
+    # puts around the path.
+    $depth = [int]$Cfg.VL_PATH_DEPTH
+    return '{{ $s := regexReplaceAll "\\\\" .PWD "/" }}' +
+        # statusline.ps1 compares against PowerShell's $HOME, which Windows derives from the
+        # profile directory, not from the HOME variable; USERPROFILE is that directory.
+        '{{ $h := trimSuffix "/" (regexReplaceAll "\\\\" .Env.USERPROFILE "/") }}' +
+        '{{ if and $h (eq (lower $s) (lower $h)) }}{{ $s = "~" }}{{ else if and $h (hasPrefix (printf "%s/" (lower $h)) (lower $s)) }}{{ $s = printf "~%s" (substr (len $h) (len $s) $s) }}{{ end }}' +
+        '{{ $l := compact (splitList "/" $s) }}{{ $n := len $l }}' +
+        '{{ if eq $n 0 }}/{{ else if and (eq $n 1) (regexMatch "^[A-Za-z]:$" (index $l 0)) }}{{ index $l 0 }}/' +
+        '{{ else if le $n ' + $depth + ' }}{{ trimSuffix "/" $s }}{{ else }}{{ index $l 0 }}/{{ index $l 1 }}/' + $G.Ellipsis + '/{{ last $l }}{{ end }}'
+}
+
+function Get-PinWalkTemplate {
+    <#
+    .SYNOPSIS
+      Template that walks from the working directory to the root, reading pin files like Read-PinFile.
+    .DESCRIPTION
+      Assigns $v the first line of the first non-empty pin file found, with control
+      characters removed and surrounding whitespace trimmed. A missing file reads as
+      empty, so the walk simply continues.
+    .PARAMETER Names
+      Pin file names checked in order in each directory.
+    .EXAMPLE
+      Get-PinWalkTemplate -Names @('.nvmrc', '.node-version')
+    #>
+    param([string[]]$Names)
+    $list = (@($Names | ForEach-Object { '"' + $_ + '"' }) -join ' ')
+    return '{{ $parts := splitList "/" (regexReplaceAll "\\\\" .AbsolutePWD "/") }}' +
+        '{{ range $i := untilStep (len $parts) 0 -1 }}{{ if not $v }}{{ $dir := join "/" (slice $parts 0 $i) }}' +
+        '{{ range $name := list ' + $list + ' }}{{ if not $v }}{{ $raw := readFile (printf "%s/%s" $dir $name) }}' +
+        '{{ $v = trim (regexReplaceAll "[\\x00-\\x1f\\x7f-\\x9f]" (regexFind "^[^\\r\\n]*" $raw) "") }}{{ end }}{{ end }}{{ end }}{{ end }}'
+}
+
+$SegmentTemplates = [ordered]@{}
+$dirTemplate = '<b>' + (Get-TextSpan (' ' + (Get-PathTemplate) + ' ')) + '</b>'
+$SegmentTemplates['dir'] = @{ Type = 'path'; Bg = $Cfg.VL_BG_DIR; Template = $dirTemplate }
+$projectBg = $Cfg.VL_BG_PROJECT
+if ([string]::IsNullOrEmpty($projectBg)) { $projectBg = $Cfg.VL_BG_DIR }
+# RepoName is the main worktree's folder in a linked worktree, matching Get-GitRoot's
+# --git-common-dir, so the name stays stable across worktrees.
+$SegmentTemplates['project'] = @{
+    Type = 'git'; Bg = $projectBg; Alias = 'CorallineProject'
+    Template = '{{ if .RepoName }}<b>' + (Get-TextSpan (' ' + (Protect-Markup $Cfg.VL_PROJECT_GLYPH) + ' ' + (Get-TruncTemplate '.RepoName') + ' ')) + '</b>{{ end }}'
+}
+# Outside a repository the project pill falls back to the directory, but only when
+# no row lists dir itself (Add-ProjectSegment).
+$SegmentTemplates['project-fallback'] = @{
+    Type = 'path'; Bg = $Cfg.VL_BG_DIR
+    Template = '{{ if not (.Segments.Contains "CorallineProject") }}' + $dirTemplate + '{{ end }}'
+}
+$probe = $Cfg.VL_RUNTIME_PROBE -eq '1'
+$nodeProbe = ''
+if ($probe) { $nodeProbe = '{{ if not $v }}{{ $v = trim (cmd "node" "--version") }}{{ end }}' }
+$nodeBg = $Cfg.VL_BG_NODE
+if ([string]::IsNullOrEmpty($nodeBg)) { $nodeBg = $Cfg.VL_BG_MODEL }
+$SegmentTemplates['node'] = @{
+    Type = 'text'; Bg = $nodeBg
+    Template = '{{ $v := "" }}' + (Get-PinWalkTemplate @('.nvmrc', '.node-version')) + $nodeProbe +
+        '{{ $v = regexReplaceAll "^v+" $v "" }}{{ if $v }}' + (Get-TextSpan (' ' + (Protect-Markup $Cfg.VL_NODE_GLYPH) + ' {{ $v }} ')) + '{{ end }}'
+}
+$pythonProbe = ''
+if ($probe) { $pythonProbe = '{{ if not $v }}{{ $v = trim (regexReplaceAll "^Python " (trim (cmd "python3" "--version")) "") }}{{ end }}' }
+$pythonBg = $Cfg.VL_BG_PYTHON
+if ([string]::IsNullOrEmpty($pythonBg)) { $pythonBg = $Cfg.VL_BG_MODEL }
+$SegmentTemplates['python'] = @{
+    Type = 'text'; Bg = $pythonBg
+    Template = '{{ $v := "" }}{{ $venv := regexReplaceAll "[\\x00-\\x1f\\x7f-\\x9f]" (default "" .Env.VIRTUAL_ENV) "" }}' +
+        '{{ $conda := regexReplaceAll "[\\x00-\\x1f\\x7f-\\x9f]" (default "" .Env.CONDA_DEFAULT_ENV) "" }}' +
+        '{{ if $venv }}{{ $v = base (regexReplaceAll "[\\\\/]+$" (regexReplaceAll "\\\\" $venv "/") "") }}' +
+        '{{ else if and $conda (ne $conda "base") }}{{ $v = $conda }}{{ else }}' + (Get-PinWalkTemplate @('.python-version')) + '{{ end }}' + $pythonProbe +
+        '{{ if $v }}' + (Get-TextSpan (' ' + (Protect-Markup $Cfg.VL_PY_GLYPH) + ' {{ $v }} ')) + '{{ end }}'
+}
+$gitDirty = '(or (gt (add .Staging.Added .Staging.Deleted .Staging.Modified .Staging.Moved) 0) (gt (add .Working.Added .Working.Deleted .Working.Modified .Working.Moved .Working.Unmerged .Working.Conflicted) 0) (gt .Working.Untracked 0))'
+$SegmentTemplates['git'] = @{
+    Type = 'git'; Bg = $Cfg.VL_BG_GIT_OK; BgDirty = $Cfg.VL_BG_GIT_DIRTY; DirtyCondition = $gitDirty
+    Options = [ordered]@{ fetch_status = $true }
+    Template = '<b>' + (Get-TextSpan (' ' + $G.Branch + ' ' + (Get-TruncTemplate '.Ref') +
+            '{{ if gt (add .Staging.Added .Staging.Deleted .Staging.Modified .Staging.Moved) 0 }}+{{ end }}' +
+            '{{ if gt (add .Working.Added .Working.Deleted .Working.Modified .Working.Moved .Working.Unmerged .Working.Conflicted) 0 }}!{{ end }}' +
+            '{{ if gt .Working.Untracked 0 }}?{{ end }}' +
+            '{{ if gt .Ahead 0 }}' + $G.Ahead + '{{ .Ahead }}{{ end }}{{ if gt .Behind 0 }}' + $G.Behind + '{{ .Behind }}{{ end }} ')) + '</b>'
+}
+$stashBg = $Cfg.VL_BG_STASH
+if ([string]::IsNullOrEmpty($stashBg)) { $stashBg = $Cfg.VL_BG_GIT_OK }
+$SegmentTemplates['stash'] = @{
+    Type = 'git'; Bg = $stashBg
+    Template = '{{ if gt .StashCount 0 }}' + (Get-TextSpan (' ' + $G.Flag + ' {{ .StashCount }} ')) + '{{ end }}'
+}
+$SegmentTemplates['model'] = @{
+    Type = 'claude'; Bg = $Cfg.VL_BG_MODEL
+    Template = '{{ if .Model.DisplayName }}<b>' + (Get-TextSpan (' ' + $G.Diamond + ' {{ trimPrefix "Claude " .Model.DisplayName }} ')) + '</b>{{ end }}'
+}
+$SegmentTemplates['effort'] = @{
+    Type = 'claude'; Bg = $Cfg.VL_BG_EFFORT
+    Template = '{{ if and .Effort .Effort.Level }}' + (Get-TextSpan (' ' + $G.Psi + ' {{ if eq .Effort.Level "medium" }}med{{ else }}{{ .Effort.Level }}{{ end }} ')) + '{{ end }}'
+}
+$ctxShow = '.ContextWindow.UsedPercentage'
+if ($Cfg.VL_CTX_ALWAYS_SHOW -eq '1') { $ctxShow = 'true' }
+$SegmentTemplates['ctx'] = @{
+    Type = 'claude'; Bg = $Cfg.VL_BG_CTX
+    Template = '{{ if ' + $ctxShow + ' }}{{ $p := 0 }}{{ if .ContextWindow.UsedPercentage }}{{ $p = int .ContextWindow.UsedPercentage }}{{ end }}' +
+        '{{ if lt $p 0 }}{{ $p = 0 }}{{ end }}{{ if gt $p 100 }}{{ $p = 100 }}{{ end }}' +
+        '{{ $cr := 0 }}{{ $cw := 0 }}{{ if .ContextWindow.CurrentUsage }}{{ $cr = .ContextWindow.CurrentUsage.CacheReadInputTokens }}{{ $cw = .ContextWindow.CurrentUsage.CacheCreationInputTokens }}{{ end }}' +
+        (Get-ColorSpan (Get-PctColorTemplate '$p') (' ' + (Protect-Markup $Cfg.VL_CTX_GLYPH) + ' ' + (Get-BarTemplate '$p') + ' {{ $p }}% ')) +
+        (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_DIM) ($G.Up + (Get-TokTemplate '.ContextWindow.TotalInputTokens') + ' ' + $G.Down + (Get-TokTemplate '.ContextWindow.TotalOutputTokens') +
+            ' cr:' + (Get-TokTemplate '$cr') + ' cw:' + (Get-TokTemplate '$cw') + ' ')) + '{{ end }}'
+}
+foreach ($window in @(@('limit5h', 'FiveHour', '5h', $Cfg.VL_BG_5H), @('limit7d', 'SevenDay', '7d', $Cfg.VL_BG_7D))) {
+    $source = '.RateLimits.' + $window[1]
+    $reset = '{{ if ' + $source + '.ResetsAt }}' + (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_DIM) ($G.Reset + (Get-CountdownTemplate ($source + '.ResetsAt')))) + '{{ end }}'
+    $SegmentTemplates[$window[0]] = @{
+        Type = 'claude'; Bg = $window[3]
+        Template = '{{ if and .RateLimits ' + $source + ' ' + $source + '.UsedPercentage }}' + (Get-BankersPctTemplate ($source + '.UsedPercentage') '$p') +
+            (Get-ColorSpan (Get-PctColorTemplate '$p') (' ' + $window[2] + ' ' + (Get-BarTemplate '$p') + ' {{ $p }}% ')) + $reset + ' {{ end }}'
+    }
+}
+$SegmentTemplates['lines'] = @{
+    Type = 'claude'; Bg = $Cfg.VL_BG_LINES
+    Template = '{{ $a := max .Cost.TotalLinesAdded 0 }}{{ $r := max .Cost.TotalLinesRemoved 0 }}{{ if or (gt $a 0) (gt $r 0) }} ' +
+        (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_OK) '+{{ $a }}') + ' ' + (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_HOT) '-{{ $r }}') + ' {{ end }}'
+}
+$costZero = '(gt $c 0.0)'
+if ($Cfg.VL_COST_ALWAYS_SHOW -eq '1') { $costZero = 'true' }
+$SegmentTemplates['cost'] = @{
+    Type = 'claude'; Bg = $Cfg.VL_BG_COST
+    Template = '{{ $c := .Cost.TotalCostUSD }}{{ if and (ge $c 0.0) (le $c 1000000000.0) ' + $costZero + ' }}' +
+        (Get-TextSpan (' ${{ printf "%.' + $Cfg.VL_COST_DECIMALS + 'f" $c }} ')) + '{{ end }}'
+}
+$SegmentTemplates['style'] = @{
+    Type = 'claude'; Bg = $Cfg.VL_BG_STYLE
+    Template = '{{ if and .OutputStyle .OutputStyle.Name (ne .OutputStyle.Name "default") }}' + (Get-TextSpan (' ' + $G.Pencil + ' {{ .OutputStyle.Name }} ')) + '{{ end }}'
+}
+$SegmentTemplates['duration'] = @{
+    Type = 'claude'; Bg = $Cfg.VL_BG_DURATION
+    Template = '{{ $ms := atoi (printf "%d" .Cost.TotalDurationMS) }}{{ if gt $ms 0 }}{{ $s := div $ms 1000 }}' +
+        (Get-TextSpan (' ' + $G.Hourglass + ' {{ if ge $s 3600 }}{{ printf "%dh%02dm" (div $s 3600) (div (mod $s 3600) 60) }}' +
+            '{{ else if ge $s 60 }}{{ printf "%dm" (div $s 60) }}{{ else }}{{ $s }}s{{ end }} ')) + '{{ end }}'
+}
+if ($Cfg.VL_CLOCK -cne 'off') {
+    $layout = '03:04 pm'
+    switch -CaseSensitive ($Cfg.VL_CLOCK) {
+        '24h' { $layout = '15:04'; if ($Cfg.VL_CLOCK_SECONDS -eq '1') { $layout = '15:04:05' } }
+        default { if ($Cfg.VL_CLOCK_SECONDS -eq '1') { $layout = '03:04:05 pm' } }
+    }
+    $SegmentTemplates['clock'] = @{
+        Type = 'time'; Bg = $Cfg.VL_BG_CLOCK
+        Template = Get-TextSpan (' ' + $G.Dot + ' {{ .CurrentDate | date "' + $layout + '" }} ')
+    }
+}
+
+function New-OmpSegment {
+    <#
+    .SYNOPSIS
+      Oh-My-Posh segment for one coralline segment in the configured style.
+    .PARAMETER Spec
+      Entry from $SegmentTemplates.
+    .EXAMPLE
+      New-OmpSegment -Spec $SegmentTemplates['model']
+    #>
+    param($Spec)
+    $bg = ConvertTo-OmpColor $Spec.Bg
+    $segment = [ordered]@{ type = $Spec.Type; style = 'diamond' }
+    switch ($Lean) {
+        $true {
+            # lean paints each segment's text in its own background colour on the shared bar.
+            $leanBg = ConvertTo-OmpColor $Cfg.VL_LEAN_BG
+            $segment.background = $(if ($leanBg) { $leanBg } else { 'transparent' })
+            $segment.foreground = $(if ($bg) { $bg } else { 'default' })
+            if ($Spec.ContainsKey('BgDirty')) { $segment.foreground_templates = @('{{ if ' + $Spec.DirtyCondition + ' }}' + (ConvertTo-OmpColor $Spec.BgDirty) + '{{ end }}') }
+            if (-not [string]::IsNullOrEmpty($Cfg.VL_LEAN_SEP)) { $segment.leading_diamond = '<default,background>' + (Protect-Diamond $Cfg.VL_LEAN_SEP) + '</>' }
+        }
+        default {
+            $segment.background = $(if ($bg) { $bg } else { 'transparent' })
+            $segment.foreground = $(if ($Cfg.VL_FG_TEXT) { ConvertTo-OmpColor $Cfg.VL_FG_TEXT } else { 'default' })
+            if ($Spec.ContainsKey('BgDirty')) { $segment.background_templates = @('{{ if ' + $Spec.DirtyCondition + ' }}' + (ConvertTo-OmpColor $Spec.BgDirty) + '{{ end }}') }
+            if (-not [string]::IsNullOrEmpty($Cfg.VL_SEP)) { $segment.leading_diamond = '<parentBackground,background>' + (Protect-Diamond $Cfg.VL_SEP) + '</>' }
+        }
+    }
+    if ($Spec.ContainsKey('Options')) { $segment.options = $Spec.Options }
+    if ($Spec.ContainsKey('Alias')) { $segment.alias = $Spec.Alias }
+    $segment.template = $Spec.Template
+    return $segment
+}
+
+# A non-empty block diamond that prints nothing: Oh-My-Posh only swaps the first
+# segment's own leading diamond (the separator) for the block's when the block has
+# one, so without it the row would open with a stray separator.
+$silentDiamond = '<transparent></>'
+$capLeft = $Cfg.VL_CAP_L
+$capRight = $Cfg.VL_CAP_R
+if ($Lean) {
+    $capLeft = ''
+    $capRight = ''
+    if (-not [string]::IsNullOrEmpty($Cfg.VL_LEAN_BG)) {
+        $capLeft = $Cfg.VL_LEAN_CAP_L
+        $capRight = $Cfg.VL_LEAN_CAP_R
+    }
+}
+$rows = @($Cfg.VL_SEGMENTS)
+if ($Cfg.VL_LAYOUT -eq 'fixed') { $rows += @($Cfg.VL_SEGMENTS2, $Cfg.VL_SEGMENTS3) }
+# Main rows are all three lists regardless of layout, as $MainSegmentNames in statusline.ps1.
+$mainNames = @(@($Cfg.VL_SEGMENTS, $Cfg.VL_SEGMENTS2, $Cfg.VL_SEGMENTS3) | ForEach-Object { if (-not [string]::IsNullOrWhiteSpace($_)) { [regex]::Split($_.Trim(), '\s+') } })
+$dirListed = $mainNames -ccontains 'dir'
+$blocks = New-Object 'System.Collections.Generic.List[object]'
+$unsupported = New-Object 'System.Collections.Generic.List[string]'
+foreach ($row in $rows) {
+    if ([string]::IsNullOrWhiteSpace($row)) { continue }
+    $segments = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($name in @([regex]::Split($row.Trim(), '\s+'))) {
+        switch ($true) {
+            { $name -ceq 'project' } {
+                [void]$segments.Add((New-OmpSegment $SegmentTemplates['project']))
+                if (-not $dirListed) { [void]$segments.Add((New-OmpSegment $SegmentTemplates['project-fallback'])) }
+                break
+            }
+            { $name -ceq 'project-fallback' } { break }
+            { $SegmentTemplates.Contains($name) } { [void]$segments.Add((New-OmpSegment $SegmentTemplates[$name])); break }
+            { $name -ceq 'clock' } { break }
+            default { if (-not $unsupported.Contains($name)) { [void]$unsupported.Add($name) } }
+        }
+    }
+    if ($segments.Count -eq 0) { continue }
+    $block = [ordered]@{ type = 'prompt'; alignment = 'left' }
+    if ($blocks.Count -gt 0) { $block.newline = $true }
+    $block.leading_diamond = $(if ($capLeft) { Protect-Diamond $capLeft } else { $silentDiamond })
+    if ($capRight) { $block.trailing_diamond = Protect-Diamond $capRight }
+    $block.segments = $segments.ToArray()
+    [void]$blocks.Add($block)
+}
+foreach ($name in $unsupported) { [Console]::Error.WriteLine('warning: segment "' + $name + '" is not supported by the Oh-My-Posh engine yet; skipped') }
+
+$config = [ordered]@{
+    '$schema' = 'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/schema.json'
+    version = 4
+    blocks = $blocks.ToArray()
+}
+
+function ConvertTo-CanonicalJson {
+    <#
+    .SYNOPSIS
+      Serialize to JSON identically on Windows PowerShell 5.1 and PowerShell 7.
+    .DESCRIPTION
+      ConvertTo-Json differs between the two (indentation, spacing, and 5.1 escaping
+      < > & ' as < and friends), so the generator writes JSON itself: two-space
+      indentation, only the escapes JSON requires, and every non-ASCII character as
+      \uXXXX so the file is pure ASCII.
+    .PARAMETER Value
+      Ordered dictionary, array, string, boolean or integer.
+    .PARAMETER Indent
+      Current indentation depth.
+    .EXAMPLE
+      ConvertTo-CanonicalJson -Value ([ordered]@{ a = @(1, 'x') }) -Indent 0
+    #>
+    param($Value, [int]$Indent)
+    $pad = '  ' * ($Indent + 1)
+    $end = '  ' * $Indent
+    switch ($true) {
+        { $null -eq $Value } { return 'null' }
+        { $Value -is [bool] } { if ($Value) { return 'true' } else { return 'false' } }
+        { $Value -is [int] -or $Value -is [long] } { return $Value.ToString($Invariant) }
+        { $Value -is [string] } {
+            $builder = New-Object System.Text.StringBuilder
+            [void]$builder.Append('"')
+            foreach ($ch in $Value.ToCharArray()) {
+                switch ([int]$ch) {
+                    34 { [void]$builder.Append('\"'); break }
+                    92 { [void]$builder.Append('\\'); break }
+                    { $_ -lt 32 -or $_ -gt 126 } { [void]$builder.AppendFormat($Invariant, '\u{0:x4}', [int]$ch); break }
+                    default { [void]$builder.Append($ch) }
+                }
+            }
+            [void]$builder.Append('"')
+            return $builder.ToString()
+        }
+        { $Value -is [System.Collections.IDictionary] } {
+            if ($Value.Count -eq 0) { return '{}' }
+            $members = foreach ($key in $Value.Keys) { $pad + (ConvertTo-CanonicalJson ([string]$key) 0) + ': ' + (ConvertTo-CanonicalJson $Value[$key] ($Indent + 1)) }
+            return "{`n" + ($members -join ",`n") + "`n" + $end + '}'
+        }
+        { $Value -is [System.Collections.IEnumerable] } {
+            $items = @(foreach ($item in $Value) { $pad + (ConvertTo-CanonicalJson $item ($Indent + 1)) })
+            if ($items.Count -eq 0) { return '[]' }
+            return "[`n" + ($items -join ",`n") + "`n" + $end + ']'
+        }
+    }
+    throw ('cannot serialize ' + $Value.GetType().FullName)
+}
+
+$text = (ConvertTo-CanonicalJson $config 0) + "`n"
+if ([string]::IsNullOrEmpty($OutFile)) { [Console]::Out.Write($text) }
+else { [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($OutFile), $text, $Utf8NoBom) }
