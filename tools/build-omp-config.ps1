@@ -31,8 +31,19 @@
 .PARAMETER OutFile
   Where the Oh-My-Posh config is written. Prints to stdout when omitted.
 
+.PARAMETER FloatOutFile
+  Where the float config for VL_FLOAT is written; not written when omitted.
+  statusline-omp.ps1 looks for coralline.float.omp.json next to the main config.
+  The config renders one block per VL_FLOAT_SEGMENTS token, each opened by a
+  U+FDD0 <index> U+FDD1 marker, so the wrapper can trim and join the segments the
+  way statusline.ps1 does. VL_FLOAT_SEGMENTS is baked in and needs a rebuild after
+  a change; VL_FLOAT_SEP and VL_FLOAT_FILE are read at render time.
+
 .EXAMPLE
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build-omp-config.ps1 -OutFile "$HOME\.claude\coralline\coralline.omp.json"
+
+.EXAMPLE
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build-omp-config.ps1 -OutFile "$HOME\.claude\coralline\coralline.omp.json" -FloatOutFile "$HOME\.claude\coralline\coralline.float.omp.json"
 
 .EXAMPLE
   pwsh -NoProfile -File .\tools\build-omp-config.ps1 -ConfigPath .\my.conf
@@ -40,7 +51,8 @@
 param(
     [string]$ConfigPath = '',
     [string]$StatuslinePath = '',
-    [string]$OutFile = ''
+    [string]$OutFile = '',
+    [string]$FloatOutFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,7 +74,7 @@ if ($parseErrors.Count -ne 0) { throw ('statusline.ps1 does not parse: ' + $pars
 $helperNames = @('Glyph', 'Remove-ControlChars', 'Copy-Config', 'Add-Utf8Text', 'Read-WordChar', 'Decode-ShellWord',
     'Test-DosDeviceComponent', 'Test-LocalPathSyntax', 'ConvertTo-LocalFullPath', 'Test-PathInside',
     'Test-NoReparseComponents', 'Test-SafeRegularFile', 'Read-StrictUtf8File', 'Import-ConfigFile',
-    'Get-BoundedInt', 'Test-Color')
+    'Get-BoundedInt', 'Test-Color', 'Get-SegmentTokens')
 $helpers = $ast.FindAll({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $helperNames -contains $node.Name
@@ -702,6 +714,76 @@ function ConvertTo-CanonicalJson {
     throw ('cannot serialize ' + $Value.GetType().FullName)
 }
 
+function ConvertTo-FloatSegment {
+    <#
+    .SYNOPSIS
+      Plain copy of a segment for the float config: no colours, diamonds or caps.
+    .DESCRIPTION
+      statusline.ps1 builds the float line without colour and strips what is left;
+      the wrapper strips the SGR codes Oh-My-Posh still writes for template markup.
+    .PARAMETER Segment
+      Segment from New-OmpSegment.
+    .EXAMPLE
+      ConvertTo-FloatSegment -Segment (New-OmpSegment $SegmentTemplates['model'])
+    #>
+    param($Segment)
+    $plain = [ordered]@{ type = $Segment.type; style = 'plain' }
+    foreach ($key in @('options', 'alias', 'template')) {
+        if ($Segment.Contains($key)) { $plain[$key] = $Segment[$key] }
+    }
+    return $plain
+}
+
+function New-FloatConfig {
+    <#
+    .SYNOPSIS
+      Float config: one block per VL_FLOAT_SEGMENTS token, each opened by its marker.
+    .DESCRIPTION
+      Block i starts with U+FDD0, the decimal i and U+FDD1, printed whether or not the
+      segment itself shows, so statusline-omp.ps1 can require exactly N markers in
+      order and cut the output into the per-token pieces statusline.ps1 trims and
+      joins. A token without a template (burn, an unknown name, clock under
+      VL_CLOCK=off) keeps its block with the marker alone and comes out empty. No
+      block sets newline: the wrapper refuses any output holding a line break.
+    .EXAMPLE
+      New-FloatConfig
+    #>
+    $open = [string][char]0xFDD0
+    $close = [string][char]0xFDD1
+    $tokens = @(Get-SegmentTokens ([string]$Cfg.VL_FLOAT_SEGMENTS))
+    $floatBlocks = New-Object 'System.Collections.Generic.List[object]'
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $name = [string]$tokens[$i]
+        $marker = $open + $i.ToString($Invariant) + $close
+        $members = New-Object 'System.Collections.Generic.List[object]'
+        switch ($true) {
+            { $name -ceq 'project' } {
+                [void]$members.Add((ConvertTo-FloatSegment (New-OmpSegment $SegmentTemplates['project'])))
+                if (-not $dirListed) { [void]$members.Add((ConvertTo-FloatSegment (New-OmpSegment $SegmentTemplates['project-fallback']))) }
+                break
+            }
+            { $name -ceq 'project-fallback' } { break }
+            { $SegmentTemplates.Contains($name) } { [void]$members.Add((ConvertTo-FloatSegment (New-OmpSegment $SegmentTemplates[$name]))); break }
+        }
+        switch ($members.Count -eq 1 -and $members[0].type -ceq 'text') {
+            # A text segment carries its marker in front of the template, outside any condition.
+            $true { $members[0].template = $marker + $members[0].template }
+            default { $members.Insert(0, [ordered]@{ type = 'text'; style = 'plain'; template = $marker }) }
+        }
+        [void]$floatBlocks.Add([ordered]@{ type = 'prompt'; alignment = 'left'; segments = $members.ToArray() })
+    }
+    return [ordered]@{
+        '$schema' = 'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/schema.json'
+        version = 4
+        var = [ordered]@{ CorallineGenerator = 'coralline-omp/1'; CorallineFloatCount = [int]$tokens.Count; CorallineFloatTokens = $tokens }
+        blocks = $floatBlocks.ToArray()
+    }
+}
+
 $text = (ConvertTo-CanonicalJson $config 0) + "`n"
 if ([string]::IsNullOrEmpty($OutFile)) { [Console]::Out.Write($text) }
 else { [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($OutFile), $text, $Utf8NoBom) }
+if (-not [string]::IsNullOrEmpty($FloatOutFile)) {
+    $floatText = (ConvertTo-CanonicalJson (New-FloatConfig) 0) + "`n"
+    [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($FloatOutFile), $floatText, $Utf8NoBom)
+}
