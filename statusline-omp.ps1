@@ -21,6 +21,14 @@
     otherwise fall back to its own default layout without saying so.
   The exit status is always 0.
 
+  VL_FLOAT: after the statusline is written, the float file is produced the way
+  statusline.ps1 produces it. The config, the float target and its collision
+  checks, and the atomic writer are coralline's own code, extracted from
+  statusline.ps1 and evaluated on every render. The text comes from a second
+  Oh-My-Posh call on the float config (tools/build-omp-config.ps1 -FloatOutFile),
+  whose per-segment markers let this script trim and join the segments with
+  VL_FLOAT_SEP. Any failure skips the float file silently.
+
 .PARAMETER OmpExe
   oh-my-posh executable. Defaults to $env:CORALLINE_OMP_EXE, then PATH.
 
@@ -28,12 +36,17 @@
   Config written by tools/build-omp-config.ps1. Defaults to
   $env:CORALLINE_OMP_CONFIG, then coralline.omp.json in the coralline state folder.
 
+.PARAMETER FloatConfig
+  Float config written by tools/build-omp-config.ps1 -FloatOutFile. Defaults to
+  $env:CORALLINE_OMP_FLOAT_CONFIG, then coralline.float.omp.json next to Config.
+
 .EXAMPLE
   Get-Content -Raw .\test\sample-input.json | powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\statusline-omp.ps1
 #>
 param(
     [string]$OmpExe = '',
-    [string]$Config = ''
+    [string]$Config = '',
+    [string]$FloatConfig = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,7 +55,10 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $Invariant = [System.Globalization.CultureInfo]::InvariantCulture
 $IntegerStyle = [System.Globalization.NumberStyles]::Integer
 $FloatStyle = [System.Globalization.NumberStyles]::Float
-$Here = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
+$WrapperPath = [string]$MyInvocation.MyCommand.Path
+$Here = Split-Path -Path $WrapperPath -Parent
+$StatuslinePath = [System.IO.Path]::Combine($Here, 'statusline.ps1')
+$script:StatuslineAst = $null
 $Stdout = [Console]::OpenStandardOutput()
 $Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
@@ -128,6 +144,23 @@ function Test-OmpConfig {
     } catch { return $false }
 }
 
+function Get-StatuslineAst {
+    <#
+    .SYNOPSIS
+      statusline.ps1 parsed once per render, or $null when it is missing or does not parse.
+    .EXAMPLE
+      Get-StatuslineAst
+    #>
+    if ($null -ne $script:StatuslineAst) { return $script:StatuslineAst }
+    $tokens = $null
+    $errors = $null
+    $ast = $null
+    try { $ast = [System.Management.Automation.Language.Parser]::ParseFile($StatuslinePath, [ref]$tokens, [ref]$errors) } catch { return $null }
+    if ($null -eq $ast -or $errors.Count -ne 0) { return $null }
+    $script:StatuslineAst = $ast
+    return $ast
+}
+
 function Get-OmpEnvironment {
     <#
     .SYNOPSIS
@@ -144,12 +177,8 @@ function Get-OmpEnvironment {
       Get-OmpEnvironment -RawInput '{"model":{"display_name":"Opus"}}'
     #>
     param([string]$RawInput)
-    $statusline = [System.IO.Path]::Combine($Here, 'statusline.ps1')
-    $tokens = $null
-    $errors = $null
-    $ast = $null
-    try { $ast = [System.Management.Automation.Language.Parser]::ParseFile($statusline, [ref]$tokens, [ref]$errors) } catch { return $null }
-    if ($null -eq $ast -or $errors.Count -ne 0) { return $null }
+    $ast = Get-StatuslineAst
+    if ($null -eq $ast) { return $null }
     $names = @('Remove-ControlChars', 'Try-BoundedDouble', 'Get-PctValue', 'ConvertTo-Epoch', 'Format-Duration',
         'Format-Tok', 'Get-JsonMember', 'Get-JsonPath', 'To-InvariantString', 'Add-CostSegment',
         'Test-DosDeviceComponent', 'Test-LocalPathSyntax', 'ConvertTo-LocalFullPath', 'ConvertTo-ProbePath')
@@ -258,6 +287,274 @@ function Get-OmpEnvironment {
     return @{ Payload = (ConvertTo-JsonText $payload); Env = $envMap }
 }
 
+function Invoke-Omp {
+    <#
+    .SYNOPSIS
+      Run `oh-my-posh claude` on a config; returns its stdout bytes, or $null when it fails.
+    .DESCRIPTION
+      Inherited CORALLINE_OMP_* variables are dropped and Environment is applied, so
+      the main render and the float render see exactly the same flags. stdout is read
+      as raw bytes: StandardOutput.ReadToEnd() would decode with the console code page
+      on 5.1. Throws when the process cannot be started.
+    .PARAMETER ExePath
+      oh-my-posh executable.
+    .PARAMETER ConfigPath
+      Validated config.
+    .PARAMETER Payload
+      stdin bytes.
+    .PARAMETER Environment
+      CORALLINE_OMP_* name -> value.
+    .EXAMPLE
+      Invoke-Omp -ExePath $OmpExe -ConfigPath $Config -Payload ([byte[]]@()) -Environment @{}
+    #>
+    param([string]$ExePath, [string]$ConfigPath, [byte[]]$Payload, $Environment)
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $ExePath
+    $startInfo.Arguments = 'claude --config "' + $ConfigPath + '"'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.CreateNoWindow = $true
+    foreach ($name in @($startInfo.EnvironmentVariables.Keys)) {
+        if (([string]$name).StartsWith('CORALLINE_OMP_', [System.StringComparison]::OrdinalIgnoreCase)) { $startInfo.EnvironmentVariables.Remove([string]$name) }
+    }
+    foreach ($name in $Environment.Keys) { $startInfo.EnvironmentVariables[[string]$name] = [string]$Environment[$name] }
+    # .NET Framework opens the child's stdin writer with Console.InputEncoding and
+    # flushes its preamble at once, so under code page 65001 the payload would start
+    # with a BOM that Oh-My-Posh's JSON decoder rejects. Swapping in the same code
+    # page without a preamble leaves the shared console's code page unchanged.
+    try {
+        $inputEncoding = [Console]::InputEncoding
+        if ($inputEncoding.CodePage -eq 65001 -and $inputEncoding.GetPreamble().Length -gt 0) { [Console]::InputEncoding = $Utf8NoBom }
+    } catch { }
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    # Write and close the pipe itself: on 5.1 closing the StreamWriter emits the
+    # console encoding's BOM after the payload, and Oh-My-Posh then drops it all.
+    $pipe = $process.StandardInput.BaseStream
+    $pipe.Write($Payload, 0, $Payload.Length)
+    $pipe.Flush()
+    $pipe.Close()
+    $output = New-Object System.IO.MemoryStream
+    $process.StandardOutput.BaseStream.CopyTo($output)
+    $process.WaitForExit()
+    if ($process.ExitCode -ne 0) { return $null }
+    return , $output.ToArray()
+}
+
+function Get-FloatCount {
+    <#
+    .SYNOPSIS
+      Number of float blocks recorded in a float config, or -1 when the record is unusable.
+    .DESCRIPTION
+      CorallineFloatCount must be an integer from 0 to 64 (statusline.ps1 renders at
+      most 64 float tokens, so indices have at most two digits) and must equal the
+      length of the CorallineFloatTokens list written beside it.
+    .PARAMETER Path
+      Float config that already passed Test-OmpConfig.
+    .EXAMPLE
+      Get-FloatCount -Path .\coralline.float.omp.json
+    #>
+    param([string]$Path)
+    try {
+        $parsed = $StrictUtf8.GetString([System.IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json -ErrorAction Stop
+        $count = $parsed.var.CorallineFloatCount
+        $names = $parsed.var.CorallineFloatTokens
+        if (-not ($count -is [int] -or $count -is [long])) { return -1 }
+        if ($count -lt 0 -or $count -gt 64) { return -1 }
+        if ($null -eq $names -or -not ($names -is [System.Array]) -or $names.Length -ne $count) { return -1 }
+        return [int]$count
+    } catch { return -1 }
+}
+
+function Invoke-OmpFloat {
+    <#
+    .SYNOPSIS
+      Write the VL_FLOAT file the way statusline.ps1 Invoke-Float does, from an Oh-My-Posh render.
+    .DESCRIPTION
+      coralline's config loader, float target resolution, collision check, text check
+      and atomic writer are extracted from statusline.ps1 unchanged and evaluated
+      here, so relative VL_FLOAT_FILE values follow the current directory of this
+      render exactly as they do natively. On top of statusline.ps1's own collision
+      set, the target may not be statusline.ps1, this script, the generator, either
+      Oh-My-Posh config or the Oh-My-Posh executable.
+
+      The float config prints U+FDD0 <i> U+FDD1 before block i. The output is
+      stripped of SGR and refused if any control character remains; it must hold
+      exactly N markers of each kind, numbered 0..N-1 in order with nothing before
+      the first. Each piece is trimmed, empty pieces are skipped, and the rest are
+      joined with the VL_FLOAT_SEP of this render.
+
+      The caller wraps the call in try/catch: every failure means no float file.
+    .PARAMETER ExePath
+      oh-my-posh executable.
+    .PARAMETER MainConfig
+      Validated main config.
+    .PARAMETER FloatConfigPath
+      Float config, or empty for the default next to MainConfig.
+    .PARAMETER Payload
+      The stdin bytes the main render received.
+    .PARAMETER Environment
+      The CORALLINE_OMP_* flags the main render received.
+    .EXAMPLE
+      Invoke-OmpFloat -ExePath $OmpExe -MainConfig $Config -FloatConfigPath '' -Payload $payloadBytes -Environment $envMap
+    #>
+    param([string]$ExePath, [string]$MainConfig, [string]$FloatConfigPath, [byte[]]$Payload, $Environment)
+    if ([string]::IsNullOrEmpty($FloatConfigPath)) { $FloatConfigPath = [string]$env:CORALLINE_OMP_FLOAT_CONFIG }
+    if ([string]::IsNullOrEmpty($FloatConfigPath)) {
+        $FloatConfigPath = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($MainConfig)), 'coralline.float.omp.json')
+    }
+    $ast = Get-StatuslineAst
+    if ($null -eq $ast) { return }
+
+    # Every function the float path reaches, including transitive helpers. A missing
+    # one skips the float file instead of failing inside the chain.
+    $names = @('Glyph', 'Remove-ControlChars', 'Copy-Config', 'Add-Utf8Text', 'Read-WordChar', 'Decode-ShellWord',
+        'Test-DosDeviceComponent', 'Test-LocalPathSyntax', 'ConvertTo-LocalFullPath', 'Test-PathInside',
+        'Test-NoReparseComponents', 'Test-SafeRegularFile', 'Read-StrictUtf8File', 'Import-ConfigFile',
+        'Get-BoundedInt', 'Test-Color', 'Get-SegmentTokens', 'Get-StatePaths', 'Test-StateObjectExists',
+        'Test-FloatCollision', 'Get-FloatTarget', 'Write-FloatAtomic', 'Test-FloatText', 'Remove-Sgr')
+    $definitions = $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $node.Name
+        }, $false)
+    foreach ($definition in $definitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
+    foreach ($name in $names) {
+        if (-not (Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue)) { return }
+    }
+
+    # Script-level statements of statusline.ps1, located by their opening text:
+    #   defaults  from `$HomeDir = [string]$HOME` to the $ConfigKeys loop, without
+    #             $ScriptDir and $ScriptPath, which describe statusline.ps1 and are set here;
+    #   config    from `$Cfg = Copy-Config $Defaults` to the Remove-ControlChars pass;
+    #   float     $FloatTokens, $FloatEnabled and the $AllStatePaths derivation.
+    $statements = $ast.EndBlock.Statements
+    $defaultsCode = New-Object System.Text.StringBuilder
+    $configCode = New-Object System.Text.StringBuilder
+    $floatCode = New-Object System.Text.StringBuilder
+    $stage = 0
+    $floatStarts = @('$FloatTokens = ', '$FloatEnabled = ', '$AllStatePaths = ', 'foreach ($base in @($Cfg.BURN_FILE, $Cfg.RL5H_FILE, $Cfg.RL7D_FILE))')
+    $floatFound = 0
+    foreach ($statement in $statements) {
+        $text = $statement.Extent.Text
+        switch ($stage) {
+            0 {
+                if ($text.StartsWith('$HomeDir = [string]$HOME', [System.StringComparison]::Ordinal)) { $stage = 1; [void]$defaultsCode.AppendLine($text) }
+                break
+            }
+            1 {
+                if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst]) { break }
+                if ($text.StartsWith('$ScriptDir = ', [System.StringComparison]::Ordinal) -or $text.StartsWith('$ScriptPath = ', [System.StringComparison]::Ordinal)) { break }
+                [void]$defaultsCode.AppendLine($text)
+                if ($text.StartsWith('foreach ($key in $Defaults.Keys)', [System.StringComparison]::Ordinal)) { $stage = 2 }
+                break
+            }
+            2 {
+                if ($text.StartsWith('$Cfg = Copy-Config $Defaults', [System.StringComparison]::Ordinal)) { $stage = 3; [void]$configCode.AppendLine($text) }
+                break
+            }
+            3 {
+                if ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst]) { break }
+                [void]$configCode.AppendLine($text)
+                if ($text.StartsWith('foreach ($key in @($Cfg.Keys)) { $Cfg[$key] = Remove-ControlChars', [System.StringComparison]::Ordinal)) { $stage = 4 }
+                break
+            }
+            4 {
+                if ($floatFound -lt $floatStarts.Count -and $text.StartsWith($floatStarts[$floatFound], [System.StringComparison]::Ordinal)) {
+                    [void]$floatCode.AppendLine($text)
+                    $floatFound++
+                }
+                break
+            }
+        }
+    }
+    if ($stage -ne 4 -or $floatFound -ne $floatStarts.Count) { return }
+
+    # statusline.ps1 runs under SilentlyContinue; the caller's catch still ends the
+    # float path on anything that would otherwise terminate a statement.
+    $ErrorActionPreference = 'SilentlyContinue'
+    $visited = $null
+    . ([scriptblock]::Create($defaultsCode.ToString()))
+    # The native script's own folder and path, not this wrapper's: $ScriptDir roots
+    # the approved themes folder, and $ScriptPath is the free variable
+    # Test-FloatCollision reads to protect statusline.ps1.
+    $ScriptDir = Split-Path -Path $StatuslinePath -Parent
+    $ScriptPath = $StatuslinePath
+    . ([scriptblock]::Create($configCode.ToString()))
+    . ([scriptblock]::Create($floatCode.ToString()))
+    if ($FloatEnabled -ne $true) { return }
+    $target = Get-FloatTarget
+    if ([string]::IsNullOrEmpty($target)) { return }
+
+    # Explicit collision set, independent of $ScriptPath above.
+    $protected = @($StatuslinePath, $WrapperPath, [System.IO.Path]::Combine($Here, 'tools', 'build-omp-config.ps1'), $MainConfig, $FloatConfigPath, $ExePath)
+    foreach ($path in $protected) {
+        if ([string]::IsNullOrEmpty([string]$path)) { continue }
+        if ($target.Equals([string]$path, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+        $full = ''
+        try { $full = [System.IO.Path]::GetFullPath([string]$path) } catch { $full = '' }
+        if (-not [string]::IsNullOrEmpty($full) -and $target.Equals($full, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+    }
+
+    # (1) render and decode
+    if (-not (Test-OmpConfig $FloatConfigPath)) { return }
+    $count = Get-FloatCount $FloatConfigPath
+    if ($count -lt 0) { return }
+    $plain = ''
+    if ($count -gt 0) {
+        $rendered = Invoke-Omp $ExePath $FloatConfigPath $Payload $Environment
+        if ($null -eq $rendered) { return }
+        $decoded = $null
+        try { $decoded = $StrictUtf8.GetString($rendered) } catch { return }
+        # (2) no control character may survive SGR removal anywhere in the output
+        $plain = Remove-Sgr $decoded
+        if (Test-FloatText $plain) { return }
+    }
+
+    # (3) exactly N markers of each kind, numbered 0..N-1 in order, nothing before the first
+    $openCount = 0
+    $closeCount = 0
+    foreach ($ch in $plain.ToCharArray()) {
+        switch ([int]$ch) {
+            0xFDD0 { $openCount++; break }
+            0xFDD1 { $closeCount++; break }
+        }
+    }
+    if ($openCount -ne $count -or $closeCount -ne $count) { return }
+    $open = [char]0xFDD0
+    $close = [char]0xFDD1
+    $pieces = New-Object 'System.Collections.Generic.List[string]'
+    $position = 0
+    for ($k = 0; $k -lt $count; $k++) {
+        if ($position -ge $plain.Length -or [int]$plain[$position] -ne 0xFDD0) { return }
+        $end = $plain.IndexOf($close, $position)
+        if ($end -lt 0) { return }
+        $digits = $plain.Substring($position + 1, $end - $position - 1)
+        if ($digits -cnotmatch '\A[0-9]{1,2}\z') { return }
+        $index = [int]::Parse($digits, $IntegerStyle, $Invariant)
+        if ($index -ne $k -or -not [string]::Equals($digits, $k.ToString($Invariant), [System.StringComparison]::Ordinal)) { return }
+        $next = $plain.IndexOf($open, $end + 1)
+        if ($next -lt 0) { $next = $plain.Length }
+        [void]$pieces.Add($plain.Substring($end + 1, $next - $end - 1))
+        $position = $next
+    }
+    if ($position -ne $plain.Length) { return }
+
+    # (4) trim each piece as Invoke-Float does and join with this render's separator
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($piece in $pieces) {
+        $trimmed = $piece.Trim()
+        if ([string]::IsNullOrEmpty($trimmed)) { continue }
+        [void]$parts.Add($trimmed)
+    }
+    $line = [string]::Join([string]$Cfg.VL_FLOAT_SEP, $parts.ToArray())
+    # (5) the joined line, separator included
+    if (Test-FloatText $line) { return }
+    # (6) size cap and atomic write
+    $bytes = $StrictUtf8.GetBytes($line + "`n")
+    if ($bytes.Length -gt 65536) { return }
+    [void](Write-FloatAtomic $target $bytes)
+}
+
 # ---- stdin, read the way statusline.ps1 reads it -------------------------------------
 $buffer = New-Object System.IO.MemoryStream
 try { [Console]::OpenStandardInput().CopyTo($buffer) } catch { }
@@ -290,37 +587,13 @@ if ($result -is [hashtable] -and $result.Payload -is [string]) {
 }
 
 # ---- render ---------------------------------------------------------------------------
+$mainBytes = [byte[]](10)
 try {
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $OmpExe
-    $startInfo.Arguments = 'claude --config "' + $Config + '"'
-    $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardInput = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.CreateNoWindow = $true
-    foreach ($name in @($startInfo.EnvironmentVariables.Keys)) {
-        if (([string]$name).StartsWith('CORALLINE_OMP_', [System.StringComparison]::OrdinalIgnoreCase)) { $startInfo.EnvironmentVariables.Remove([string]$name) }
-    }
-    foreach ($name in $envMap.Keys) { $startInfo.EnvironmentVariables[[string]$name] = [string]$envMap[$name] }
-    # .NET Framework opens the child's stdin writer with Console.InputEncoding and
-    # flushes its preamble at once, so under code page 65001 the payload would start
-    # with a BOM that Oh-My-Posh's JSON decoder rejects. Swapping in the same code
-    # page without a preamble leaves the shared console's code page unchanged.
-    try {
-        $inputEncoding = [Console]::InputEncoding
-        if ($inputEncoding.CodePage -eq 65001 -and $inputEncoding.GetPreamble().Length -gt 0) { [Console]::InputEncoding = $Utf8NoBom }
-    } catch { }
-    $process = [System.Diagnostics.Process]::Start($startInfo)
-    # Write and close the pipe itself: on 5.1 closing the StreamWriter emits the
-    # console encoding's BOM after the payload, and Oh-My-Posh then drops it all.
-    $pipe = $process.StandardInput.BaseStream
-    $pipe.Write($payloadBytes, 0, $payloadBytes.Length)
-    $pipe.Flush()
-    $pipe.Close()
-    $output = New-Object System.IO.MemoryStream
-    $process.StandardOutput.BaseStream.CopyTo($output)
-    $process.WaitForExit()
-    if ($process.ExitCode -ne 0) { Exit-Blank }
-    Write-Bytes $output.ToArray()
-} catch { Exit-Blank }
+    $rendered = Invoke-Omp $OmpExe $Config $payloadBytes $envMap
+    if ($null -ne $rendered) { $mainBytes = $rendered }
+} catch { }
+Write-Bytes $mainBytes
+
+# ---- float, after the statusline is out; a failure never reaches stdout or the exit code
+try { Invoke-OmpFloat $OmpExe $Config $FloatConfig $payloadBytes $envMap } catch { }
 exit 0
