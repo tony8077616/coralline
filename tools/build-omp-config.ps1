@@ -14,8 +14,8 @@
   VL_SEGMENTS3; gauge thresholds, bar width and glyphs; VL_ASCII; path depth;
   name truncation; cost decimals; clock modes; the *_ALWAYS_SHOW switches; and the
   segments dir, project, git, stash, node, python, model, effort, ctx, limit5h,
-  limit7d, lines, cost, style, duration and clock. Other segment names are skipped
-  with a warning.
+  limit7d, lines, cost, style, duration and clock, plus cache when rendered through
+  statusline-omp.ps1. Other segment names are skipped with a warning.
 
   The output is pure ASCII JSON with LF line endings, identical under Windows
   PowerShell 5.1 and PowerShell 7.
@@ -313,9 +313,13 @@ function Get-TokTemplate {
     .EXAMPLE
       Get-TokTemplate -Expression '.ContextWindow.TotalInputTokens'
     #>
-    param([string]$Expression)
-    return '{{ $n := ' + $Expression + ' }}{{ if ge $n 1000000 }}{{ printf "%d.%dM" (div $n 1000000) (div (mod $n 1000000) 100000) }}' +
+    param([string]$Expression, [string]$EnvName = '')
+    $formatted = '{{ $n := ' + $Expression + ' }}{{ if ge $n 1000000 }}{{ printf "%d.%dM" (div $n 1000000) (div (mod $n 1000000) 100000) }}' +
         '{{ else if ge $n 1000 }}{{ printf "%d.%dk" (div $n 1000) (div (mod $n 1000) 100) }}{{ else }}{{ $n }}{{ end }}'
+    if ([string]::IsNullOrEmpty($EnvName)) { return $formatted }
+    # statusline-omp.ps1 passes coralline's own Format-Tok text, which keeps a
+    # non-integer payload value verbatim where an Oh-My-Posh int cannot.
+    return '{{ if .Env.' + $EnvName + ' }}{{ .Env.' + $EnvName + ' }}{{ else }}' + $formatted + '{{ end }}'
 }
 
 function Get-TruncTemplate {
@@ -382,7 +386,9 @@ function Get-PathTemplate {
     # No {{- -}} trim markers: they would also eat the literal spaces the caller
     # puts around the path.
     $depth = [int]$Cfg.VL_PATH_DEPTH
-    return '{{ $s := regexReplaceAll "\\\\" .PWD "/" }}' +
+    # statusline-omp.ps1 passes the payload directory verbatim: Oh-My-Posh replaces a
+    # directory that does not exist with its own working folder.
+    return '{{ $s := regexReplaceAll "\\\\" (or .Env.CORALLINE_OMP_CWD .PWD) "/" }}' +
         # statusline.ps1 compares against PowerShell's $HOME, which Windows derives from the
         # profile directory, not from the HOME variable; USERPROFILE is that directory.
         '{{ $h := trimSuffix "/" (regexReplaceAll "\\\\" .Env.USERPROFILE "/") }}' +
@@ -480,12 +486,24 @@ $ctxShow = '.ContextWindow.UsedPercentage'
 if ($Cfg.VL_CTX_ALWAYS_SHOW -eq '1') { $ctxShow = 'true' }
 $SegmentTemplates['ctx'] = @{
     Type = 'claude'; Bg = $Cfg.VL_BG_CTX
-    Template = '{{ if ' + $ctxShow + ' }}{{ $p := 0 }}{{ if .ContextWindow.UsedPercentage }}{{ $p = int .ContextWindow.UsedPercentage }}{{ end }}' +
+    Template = '{{ if and (not .Env.CORALLINE_OMP_CTX_HIDE) ' + $ctxShow + ' }}{{ $p := 0 }}{{ if .ContextWindow.UsedPercentage }}{{ $p = int .ContextWindow.UsedPercentage }}{{ end }}' +
         '{{ if lt $p 0 }}{{ $p = 0 }}{{ end }}{{ if gt $p 100 }}{{ $p = 100 }}{{ end }}' +
         '{{ $cr := 0 }}{{ $cw := 0 }}{{ if .ContextWindow.CurrentUsage }}{{ $cr = .ContextWindow.CurrentUsage.CacheReadInputTokens }}{{ $cw = .ContextWindow.CurrentUsage.CacheCreationInputTokens }}{{ end }}' +
         (Get-ColorSpan (Get-PctColorTemplate '$p') (' ' + (Protect-Markup $Cfg.VL_CTX_GLYPH) + ' ' + (Get-BarTemplate '$p') + ' {{ $p }}% ')) +
-        (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_DIM) ($G.Up + (Get-TokTemplate '.ContextWindow.TotalInputTokens') + ' ' + $G.Down + (Get-TokTemplate '.ContextWindow.TotalOutputTokens') +
-            ' cr:' + (Get-TokTemplate '$cr') + ' cw:' + (Get-TokTemplate '$cw') + ' ')) + '{{ end }}'
+        (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_DIM) ($G.Up + (Get-TokTemplate '.ContextWindow.TotalInputTokens' 'CORALLINE_OMP_TOK_IN') + ' ' +
+            $G.Down + (Get-TokTemplate '.ContextWindow.TotalOutputTokens' 'CORALLINE_OMP_TOK_OUT') +
+            ' cr:' + (Get-TokTemplate '$cr' 'CORALLINE_OMP_TOK_CR') + ' cw:' + (Get-TokTemplate '$cw' 'CORALLINE_OMP_TOK_CW') + ' ')) + '{{ end }}'
+}
+# prompt_cache is not part of Oh-My-Posh's Claude model, so statusline-omp.ps1 computes
+# the percentage and the countdown with coralline's own helpers and passes them in
+# the environment. A direct `oh-my-posh claude` call has neither and hides the segment.
+$cacheBg = $Cfg.VL_BG_CACHE
+if ([string]::IsNullOrEmpty($cacheBg)) { $cacheBg = $Cfg.VL_BG_CTX }
+$SegmentTemplates['cache'] = @{
+    Type = 'text'; Bg = $cacheBg
+    Template = '{{ if .Env.CORALLINE_OMP_CACHE_PCT }}{{ $p := atoi .Env.CORALLINE_OMP_CACHE_PCT }}{{ $q := sub 100 $p }}' +
+        (Get-ColorSpan (Get-PctColorTemplate '$q') (' ' + (Protect-Markup $Cfg.VL_CACHE_GLYPH) + ' {{ $p }}% ')) +
+        (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_DIM) ('{{ if eq .Env.CORALLINE_OMP_CACHE_LEFT "cold" }}cold{{ else }}' + $G.Reset + '{{ .Env.CORALLINE_OMP_CACHE_LEFT }}{{ end }} ')) + '{{ end }}'
 }
 foreach ($window in @(@('limit5h', 'FiveHour', '5h', $Cfg.VL_BG_5H), @('limit7d', 'SevenDay', '7d', $Cfg.VL_BG_7D))) {
     $source = '.RateLimits.' + $window[1]
@@ -505,7 +523,7 @@ $costZero = '(gt $c 0.0)'
 if ($Cfg.VL_COST_ALWAYS_SHOW -eq '1') { $costZero = 'true' }
 $SegmentTemplates['cost'] = @{
     Type = 'claude'; Bg = $Cfg.VL_BG_COST
-    Template = '{{ $c := .Cost.TotalCostUSD }}{{ if and (ge $c 0.0) (le $c 1000000000.0) ' + $costZero + ' }}' +
+    Template = '{{ $c := .Cost.TotalCostUSD }}{{ if and (not .Env.CORALLINE_OMP_COST_HIDE) (ge $c 0.0) (le $c 1000000000.0) ' + $costZero + ' }}' +
         (Get-TextSpan (' ${{ printf "%.' + $Cfg.VL_COST_DECIMALS + 'f" $c }} ')) + '{{ end }}'
 }
 $SegmentTemplates['style'] = @{
@@ -529,6 +547,11 @@ if ($Cfg.VL_CLOCK -cne 'off') {
         Template = Get-TextSpan (' ' + $G.Dot + ' {{ .CurrentDate | date "' + $layout + '" }} ')
     }
 }
+
+$SegmentTemplates['dir'].HideEnv = @('CORALLINE_OMP_NODIR')
+$SegmentTemplates['project-fallback'].HideEnv = @('CORALLINE_OMP_NODIR')
+$SegmentTemplates['project'].HideEnv = @('CORALLINE_OMP_NODIR', 'CORALLINE_OMP_NOPROBE')
+foreach ($name in @('git', 'stash', 'node', 'python')) { $SegmentTemplates[$name].HideEnv = @('CORALLINE_OMP_NOPROBE') }
 
 function New-OmpSegment {
     <#
@@ -561,6 +584,14 @@ function New-OmpSegment {
     if ($Spec.ContainsKey('Options')) { $segment.options = $Spec.Options }
     if ($Spec.ContainsKey('Alias')) { $segment.alias = $Spec.Alias }
     $segment.template = $Spec.Template
+    # statusline-omp.ps1 sets these when the payload has no usable directory, where
+    # statusline.ps1 hides the segment and Oh-My-Posh would use its own working folder.
+    if ($Spec.ContainsKey('HideEnv')) {
+        $conditions = @($Spec.HideEnv | ForEach-Object { '.Env.' + $_ })
+        $test = $conditions[0]
+        if ($conditions.Count -gt 1) { $test = '(or ' + [string]::Join(' ', $conditions) + ')' }
+        $segment.template = '{{ if not ' + $test + ' }}' + $Spec.Template + '{{ end }}'
+    }
     return $segment
 }
 
@@ -614,6 +645,9 @@ foreach ($name in $unsupported) { [Console]::Error.WriteLine('warning: segment "
 $config = [ordered]@{
     '$schema' = 'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/schema.json'
     version = 4
+    # statusline-omp.ps1 refuses any config without this marker, because Oh-My-Posh
+    # silently renders its own default layout for a config it cannot read.
+    var = [ordered]@{ CorallineGenerator = 'coralline-omp/1' }
     blocks = $blocks.ToArray()
 }
 
