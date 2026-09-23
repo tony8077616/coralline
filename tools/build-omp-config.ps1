@@ -14,8 +14,12 @@
   VL_SEGMENTS3; gauge thresholds, bar width and glyphs; VL_ASCII; path depth;
   name truncation; cost decimals; clock modes; the *_ALWAYS_SHOW switches; and the
   segments dir, project, git, stash, node, python, model, effort, ctx, limit5h,
-  limit7d, lines, cost, style, duration and clock, plus cache when rendered through
-  statusline-omp.ps1. Other segment names are skipped with a warning.
+  limit7d, lines, cost, style, duration and clock, plus cache and burn when rendered
+  through statusline-omp.ps1. Other segment names are skipped with a warning.
+
+  burn and VL_LIMIT_SYNC need statusline-omp.ps1, which runs coralline's own state
+  layer on every render. A direct `oh-my-posh claude --config` call hides burn and
+  shows limit5h / limit7d from the payload alone, never from the synced store.
 
   The output is pure ASCII JSON with LF line endings, identical under Windows
   PowerShell 5.1 and PowerShell 7.
@@ -181,7 +185,7 @@ $Lean = $Cfg.VL_STYLE -eq 'lean'
 $G = @{
     Branch = Glyph 0x2387; Diamond = Glyph 0x25C6; Flag = Glyph 0x2691; Dot = Glyph 0x2299; Pencil = Glyph 0x270E
     Hourglass = Glyph 0x29D6; Psi = Glyph 0x03C8; Ahead = Glyph 0x21E1; Behind = Glyph 0x21E3; Ellipsis = Glyph 0x2026
-    Up = Glyph 0x2191; Down = Glyph 0x2193; Reset = Glyph 0x21BA
+    Up = Glyph 0x2191; Down = Glyph 0x2193; Reset = Glyph 0x21BA; Check = Glyph 0x2713; BurnTo = Glyph 0x21E2
 }
 
 function ConvertTo-OmpColor {
@@ -517,6 +521,24 @@ $SegmentTemplates['cache'] = @{
         (Get-ColorSpan (Get-PctColorTemplate '$q') (' ' + (Protect-Markup $Cfg.VL_CACHE_GLYPH) + ' {{ $p }}% ')) +
         (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_DIM) ('{{ if eq .Env.CORALLINE_OMP_CACHE_LEFT "cold" }}cold{{ else }}' + $G.Reset + '{{ .Env.CORALLINE_OMP_CACHE_LEFT }}{{ end }} ')) + '{{ end }}'
 }
+# burn: statusline-omp.ps1 runs coralline's own state layer and passes Add-BurnSegment's
+# decision in the environment: CORALLINE_OMP_BURN (warming, idle, done or active),
+# CORALLINE_OMP_BURN_TONE (dim, ok, warn or hot) and, when active, CORALLINE_OMP_BURN_ETA
+# ("5h 1h28m", ASCII only). The arrow between label and ETA is written here. A direct
+# `oh-my-posh claude` call has none of them and hides the segment.
+$burnBg = $Cfg.VL_BG_BURN
+if ([string]::IsNullOrEmpty($burnBg)) { $burnBg = $Cfg.VL_BG_5H }
+$burnTone = '{{ if eq .Env.CORALLINE_OMP_BURN_TONE "hot" }}' + (ConvertTo-OmpColor $Cfg.VL_FG_HOT) +
+    '{{ else if eq .Env.CORALLINE_OMP_BURN_TONE "warn" }}' + (ConvertTo-OmpColor $Cfg.VL_FG_WARN) +
+    '{{ else if eq .Env.CORALLINE_OMP_BURN_TONE "ok" }}' + (ConvertTo-OmpColor $Cfg.VL_FG_OK) +
+    '{{ else }}' + (ConvertTo-OmpColor $Cfg.VL_FG_DIM) + '{{ end }}'
+$burnText = ' ' + (Protect-Markup $Cfg.VL_BURN_GLYPH) + ' {{ if eq .Env.CORALLINE_OMP_BURN "warming" }}' + $G.Ellipsis +
+    '{{ else if eq .Env.CORALLINE_OMP_BURN "active" }}{{ $e := splitList " " .Env.CORALLINE_OMP_BURN_ETA }}{{ index $e 0 }} ' + $G.BurnTo + ' {{ index $e 1 }}' +
+    '{{ else }}' + $G.Check + '{{ end }} '
+$SegmentTemplates['burn'] = @{
+    Type = 'text'; Bg = $burnBg
+    Template = '{{ if .Env.CORALLINE_OMP_BURN }}' + (Get-ColorSpan $burnTone $burnText) + '{{ end }}'
+}
 foreach ($window in @(@('limit5h', 'FiveHour', '5h', $Cfg.VL_BG_5H), @('limit7d', 'SevenDay', '7d', $Cfg.VL_BG_7D))) {
     $source = '.RateLimits.' + $window[1]
     $reset = '{{ if ' + $source + '.ResetsAt }}' + (Get-ColorSpan (ConvertTo-OmpColor $Cfg.VL_FG_DIM) ($G.Reset + (Get-CountdownTemplate ($source + '.ResetsAt')))) + '{{ end }}'
@@ -742,7 +764,7 @@ function New-FloatConfig {
       Block i starts with U+FDD0, the decimal i and U+FDD1, printed whether or not the
       segment itself shows, so statusline-omp.ps1 can require exactly N markers in
       order and cut the output into the per-token pieces statusline.ps1 trims and
-      joins. A token without a template (burn, an unknown name, clock under
+      joins. A token without a template (an unknown name, clock under
       VL_CLOCK=off) keeps its block with the marker alone and comes out empty. No
       block sets newline: the wrapper refuses any output holding a line break.
     .EXAMPLE
