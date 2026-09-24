@@ -49,13 +49,29 @@
   Float config written by tools/build-omp-config.ps1 -FloatOutFile. Defaults to
   $env:CORALLINE_OMP_FLOAT_CONFIG, then coralline.float.omp.json next to Config.
 
+.PARAMETER Rest
+  Every argument that is not one of the three named parameters above. A single
+  '--subagent' (case-sensitive) hands the whole render to statusline.ps1's own
+  --subagent mode, in the same process, unchanged: this script never renders
+  subagent panels through Oh-My-Posh, because that mode emits one JSON-lines
+  row per task and Oh-My-Posh's claude segment renders a single payload. Any
+  other combination of extra arguments (wrong case, an extra token, a bare
+  positional value) is not a supported call shape; this script prints an
+  empty line and exits 0, same as an unrecognised call always has.
+
 .EXAMPLE
   Get-Content -Raw .\test\sample-input.json | powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\statusline-omp.ps1
+
+.EXAMPLE
+  Get-Content -Raw .\test\sample-subagent-input.json | powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\statusline-omp.ps1 --subagent
 #>
+[CmdletBinding(PositionalBinding=$false)]
 param(
     [string]$OmpExe = '',
     [string]$Config = '',
-    [string]$FloatConfig = ''
+    [string]$FloatConfig = '',
+    [Parameter(ValueFromRemainingArguments=$true)]
+    [string[]]$Rest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,6 +86,24 @@ $StatuslinePath = [System.IO.Path]::Combine($Here, 'statusline.ps1')
 $GeneratorPath = [System.IO.Path]::Combine($Here, 'tools', 'build-omp-config.ps1')
 $script:StatuslineAst = $null
 $Stdout = [Console]::OpenStandardOutput()
+
+# ---- --subagent: hand the whole render to statusline.ps1, in this same process --------
+# Must run before stdin is read, before the config is loaded, before any Oh-My-Posh
+# parsing: statusline.ps1's --subagent mode reads stdin and writes stdout itself, and
+# this script must not consume or transform any of those bytes.
+if ($Rest.Count -eq 1 -and $Rest[0] -ceq '--subagent') {
+    try { & $StatuslinePath '--subagent' } catch { }
+    exit 0
+}
+if ($Rest.Count -gt 0) {
+    # Any other extra-argument shape (wrong case, an extra token, a bare value) is not
+    # a supported call: same empty-line, exit-0 fallback as every other unrecognised case.
+    # Write-Bytes is defined further down the script, so this writes the bytes directly.
+    $blank = [byte[]](10)
+    $Stdout.Write($blank, 0, $blank.Length)
+    $Stdout.Flush()
+    exit 0
+}
 
 function Write-Bytes {
     <#
