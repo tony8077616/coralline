@@ -76,7 +76,7 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($StatuslinePath, [ref]$parseTokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) { throw ('statusline.ps1 does not parse: ' + $parseErrors[0].Message) }
 $helperNames = @('Glyph', 'Remove-ControlChars', 'Copy-Config', 'Add-Utf8Text', 'Read-WordChar', 'Decode-ShellWord',
-    'Test-DosDeviceComponent', 'Test-LocalPathSyntax', 'ConvertTo-LocalFullPath', 'Test-PathInside',
+    'Add-Utf8Run', 'Test-DosDeviceComponent', 'Test-LocalPathSyntax', 'ConvertTo-LocalFullPath', 'Test-PathInside',
     'Test-NoReparseComponents', 'Test-SafeRegularFile', 'Read-StrictUtf8File', 'Import-ConfigFile',
     'Get-BoundedInt', 'Test-Color', 'Get-SegmentTokens')
 $helpers = $ast.FindAll({
@@ -86,6 +86,231 @@ $helpers = $ast.FindAll({
 foreach ($definition in $helpers) { . ([scriptblock]::Create($definition.Extent.Text)) }
 foreach ($name in $helperNames) {
     if (-not (Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue)) { throw ('statusline.ps1 no longer defines ' + $name) }
+}
+
+function Test-NoExitCode {
+    <#
+    .SYNOPSIS
+      True when none of the given AST nodes holds an exit statement or an [Environment]::Exit call.
+    .PARAMETER Nodes
+      Statements taken from statusline.ps1.
+    .EXAMPLE
+      Test-NoExitCode -Nodes @($statement)
+    #>
+    param([object[]]$Nodes)
+    foreach ($node in $Nodes) {
+        if ($null -ne $node.Find({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true)) { return $false }
+        if ([regex]::IsMatch([string]$node.Extent.Text, '\[\s*(System\s*\.\s*)?Environment\s*\]\s*::\s*Exit', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) { return $false }
+    }
+    return $true
+}
+
+function Get-AstVariableName {
+    <#
+    .SYNOPSIS
+      A variable's name without its scope or drive qualifier (script:, global:, local:, private:, using:, variable:).
+    .PARAMETER Variable
+      VariableExpressionAst.
+    .EXAMPLE
+      Get-AstVariableName -Variable $node
+    #>
+    param($Variable)
+    return [regex]::Replace([string]$Variable.VariablePath.UserPath, '^(?i:script|global|local|private|using|variable):', '')
+}
+
+function Get-StatuslineWriteCount {
+    <#
+    .SYNOPSIS
+      Number of places anywhere in statusline.ps1 that may write the variable, compared without case.
+    .DESCRIPTION
+      The same conservative count statusline-omp.ps1 uses: assignment targets at
+      any depth (any operator, scope or type constraint), foreach variables, [ref]
+      conversions, *-Variable commands and aliases naming it, -OutVariable and the
+      other common variable parameters naming it, variable:<name> paths and
+      .Set(<name>, ...) calls.
+    .PARAMETER Ast
+      Parsed statusline.ps1.
+    .PARAMETER Name
+      Variable name without $.
+    .EXAMPLE
+      Get-StatuslineWriteCount -Ast $ast -Name 'ShellWordStops'
+    #>
+    param($Ast, [string]$Name)
+    # One pass over the tree, kept for this AST: every node that could write some
+    # variable. Commands are kept only when they are *-Variable commands or carry a
+    # common variable parameter, [ref] conversions and variable: paths only as such.
+    if ($null -eq $script:OmpWriteSiteCache -or -not [object]::ReferenceEquals($script:OmpWriteSiteCache.Ast, $Ast)) {
+        # Plain type tests with early returns: this predicate runs once per node.
+        $sites = $Ast.FindAll({
+                param($n)
+                if ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -or $n -is [System.Management.Automation.Language.ForEachStatementAst]) { return $true }
+                if ($n -is [System.Management.Automation.Language.CommandAst]) {
+                    # A nested command is a node of its own, so only this command's own elements matter.
+                    if ([string]$n.GetCommandName() -match '(^|\\)(?i:Set-Variable|New-Variable|Clear-Variable|Remove-Variable|sv|set|nv|clv|rv)$') { return $true }
+                    foreach ($element in $n.CommandElements) {
+                        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and $element.ParameterName -match '^(?i:ov|ev|wv|iv|pv|OutV[a-z]*|ErrorV[a-z]*|WarningV[a-z]*|InformationV[a-z]*|PipelineV[a-z]*)$') { return $true }
+                    }
+                    return $false
+                }
+                if ($n -is [System.Management.Automation.Language.ConvertExpressionAst]) { return ($n.Type.TypeName.Name -match '^(?i:ref|System\.Management\.Automation\.PSReference)$') }
+                if ($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return ([string]$n.Value).StartsWith('variable:', [System.StringComparison]::OrdinalIgnoreCase) }
+                if ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return ([string]$n.Member.Extent.Text -match '^(?i:Set)$') }
+                return $false
+            }, $true)
+        $script:OmpWriteSiteCache = @{ Ast = $Ast; Sites = @($sites); Text = [string]$Ast.Extent.Text; Start = [int]$Ast.Extent.StartOffset }
+    }
+    # Every write site spells the name somewhere in its own text, so only sites that
+    # contain an occurrence of it are examined.
+    $hits = New-Object 'System.Collections.Generic.List[int]'
+    $text = $script:OmpWriteSiteCache.Text
+    $at = $text.IndexOf($Name, [System.StringComparison]::OrdinalIgnoreCase)
+    while ($at -ge 0) {
+        [void]$hits.Add($at + $script:OmpWriteSiteCache.Start)
+        $at = $text.IndexOf($Name, $at + 1, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    $count = 0
+    if ($hits.Count -eq 0) { return $count }
+    foreach ($site in $script:OmpWriteSiteCache.Sites) {
+        $from = $site.Extent.StartOffset
+        $to = $site.Extent.EndOffset
+        $spelled = $false
+        foreach ($hit in $hits) { if ($hit -ge $from -and $hit -lt $to) { $spelled = $true; break } }
+        if (-not $spelled) { continue }
+        switch ($true) {
+            { $site -is [System.Management.Automation.Language.AssignmentStatementAst] } {
+                foreach ($target in $site.Left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+                    if ([string]::Equals((Get-AstVariableName $target), $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $count++ }
+                }
+                break
+            }
+            { $site -is [System.Management.Automation.Language.ForEachStatementAst] } {
+                if ([string]::Equals((Get-AstVariableName $site.Variable), $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $count++ }
+                break
+            }
+            { $site -is [System.Management.Automation.Language.ConvertExpressionAst] } {
+                foreach ($target in $site.Child.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+                    if ([string]::Equals((Get-AstVariableName $target), $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $count++ }
+                }
+                break
+            }
+            { $site -is [System.Management.Automation.Language.StringConstantExpressionAst] } {
+                if ([string]::Equals([string]$site.Value, 'variable:' + $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $count++ }
+                break
+            }
+            { $site -is [System.Management.Automation.Language.InvokeMemberExpressionAst] } {
+                foreach ($argument in @($site.Arguments)) {
+                    if ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst] -and [string]::Equals([string]$argument.Value, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $count++ }
+                }
+                break
+            }
+            default {
+                $namesIt = $false
+                foreach ($constant in $site.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)) {
+                    if ([string]::Equals(([string]$constant.Value).TrimStart('+'), $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $namesIt = $true }
+                }
+                if ($namesIt) { $count++ }
+            }
+        }
+    }
+    return $count
+}
+
+function Get-StatuslineBinding {
+    <#
+    .SYNOPSIS
+      Script text of the one script-level constant assignment of a statusline.ps1 variable; throws otherwise.
+    .DESCRIPTION
+      The assignment must be a direct statement of the script body, operator =,
+      with the unqualified variable alone on the left; the variable may be written
+      nowhere else in the file; the right side may hold no variable other than
+      $true, $false and $null, no command, no $( ), no script block and no nested
+      assignment; and nothing may exit.
+    .PARAMETER Ast
+      Parsed statusline.ps1.
+    .PARAMETER Name
+      Variable name without $.
+    .EXAMPLE
+      Get-StatuslineBinding -Ast $ast -Name 'ShellWordStops'
+    #>
+    param($Ast, [string]$Name)
+    $writes = Get-StatuslineWriteCount $Ast $Name
+    if ($writes -ne 1) { throw ('statusline.ps1 writes $' + $Name + ' in ' + $writes + ' places; expected exactly one') }
+    $source = $null
+    foreach ($statement in $Ast.EndBlock.Statements) {
+        if ($statement -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
+        if ($statement.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) { continue }
+        if ($statement.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        if (-not $statement.Left.VariablePath.IsUnqualified) { continue }
+        if ([string]::Equals((Get-AstVariableName $statement.Left), $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $source = $statement }
+    }
+    if ($null -eq $source) { throw ('statusline.ps1 no longer assigns $' + $Name + ' at script level') }
+    $forbidden = $source.Right.Find({
+            param($n)
+            ($n -is [System.Management.Automation.Language.VariableExpressionAst] -and @('true', 'false', 'null') -notcontains [string]$n.VariablePath.UserPath) -or
+            $n -is [System.Management.Automation.Language.CommandAst] -or
+            $n -is [System.Management.Automation.Language.SubExpressionAst] -or
+            $n -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -or
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst]
+        }, $true)
+    if ($null -ne $forbidden) { throw ('statusline.ps1 assigns $' + $Name + ' from something other than a constant') }
+    if (-not (Test-NoExitCode @($source))) { throw ('statusline.ps1 assignment of $' + $Name + ' can exit') }
+    return [string]$source.Extent.Text + "`n"
+}
+
+function Get-StatuslineHomeBinding {
+    <#
+    .SYNOPSIS
+      statusline.ps1's two $HomeDir statements as script text; throws otherwise.
+    .DESCRIPTION
+      Each statement must appear exactly once in the script body with exactly this
+      text (ordinal), the second directly after the first, and nothing else in the
+      file may write $HomeDir.
+    .PARAMETER Ast
+      Parsed statusline.ps1.
+    .EXAMPLE
+      Get-StatuslineHomeBinding -Ast $ast
+    #>
+    param($Ast)
+    $assignText = '$HomeDir = [string]$HOME'
+    $fallbackText = "if ([string]::IsNullOrEmpty(`$HomeDir)) { `$HomeDir = [Environment]::GetFolderPath('UserProfile') }"
+    $statements = $Ast.EndBlock.Statements
+    $assignAt = -1
+    $assignCount = 0
+    $fallbackCount = 0
+    for ($i = 0; $i -lt $statements.Count; $i++) {
+        $text = [string]$statements[$i].Extent.Text
+        if ([string]::Equals($text, $assignText, [System.StringComparison]::Ordinal)) { $assignCount++; $assignAt = $i }
+        if ([string]::Equals($text, $fallbackText, [System.StringComparison]::Ordinal)) { $fallbackCount++ }
+    }
+    if ($assignCount -ne 1 -or $fallbackCount -ne 1 -or ($assignAt + 1) -ge $statements.Count -or
+        -not [string]::Equals([string]$statements[$assignAt + 1].Extent.Text, $fallbackText, [System.StringComparison]::Ordinal)) {
+        throw 'statusline.ps1 no longer sets $HomeDir with the expected two statements'
+    }
+    $writes = Get-StatuslineWriteCount $Ast 'HomeDir'
+    if ($writes -ne 2) { throw ('statusline.ps1 writes $HomeDir in ' + $writes + ' places; expected exactly two') }
+    if (-not (Test-NoExitCode @($statements[$assignAt], $statements[$assignAt + 1]))) { throw 'statusline.ps1 $HomeDir statements can exit' }
+    return $assignText + "`n" + $fallbackText + "`n"
+}
+
+# Script-level values the parser reads, bound from statusline.ps1's own statements:
+# $HomeDir (for ~ and $HOME in path values) and the quoting tables Decode-ShellWord
+# scans with. Each must bind to a non-empty value that decodes a fixed word per
+# quoting context exactly as expected.
+$HomeDir = $null
+. ([scriptblock]::Create((Get-StatuslineHomeBinding $ast)))
+if (-not ($HomeDir -is [string] -and $HomeDir.Length -gt 0)) { throw 'statusline.ps1 left $HomeDir empty' }
+foreach ($name in @('ShellWordStops', 'ShellDoubleQuoteStops', 'ShellAnsiQuoteStops')) {
+    $bindingCode = Get-StatuslineBinding $ast $name
+    Set-Variable -Name $name -Value $null
+    . ([scriptblock]::Create($bindingCode))
+    $bound = Get-Variable -Name $name -ValueOnly
+    if (-not ($bound -is [char[]] -and $bound.Length -gt 0)) { throw ('statusline.ps1 $' + $name + ' is not a non-empty [char[]]') }
+}
+foreach ($canary in @(@('abc  # note', 'abc'), @('"a b\"c"', 'a b"c'), @("`$'a\tb'", "a`tb"), @("'x y'", 'x y'))) {
+    $decodedWord = Decode-ShellWord $canary[0] $false
+    if (-not ($decodedWord.Success -eq $true -and [string]::Equals([string]$decodedWord.Value, $canary[1], [System.StringComparison]::Ordinal))) {
+        throw ('statusline.ps1 Decode-ShellWord no longer decodes ' + $canary[0] + ' as expected')
+    }
 }
 $defaultsAst = $ast.Find({
         param($node)
