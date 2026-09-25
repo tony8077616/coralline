@@ -298,6 +298,14 @@ function Get-StatuslineConfigCode {
                   them) and without $ScriptDir and $ScriptPath, which describe
                   statusline.ps1 and are set by the caller;
         Config    from `$Cfg = Copy-Config $Defaults` to the Remove-ControlChars pass.
+      Since statusline.ps1 v0.18.0 that pass follows the integer settings, so Config
+      also holds, in statusline.ps1's order, the $Invariant, $IntegerStyle and
+      $FloatStyle assignments, every Get-BoundedInt normalisation and the
+      VL_HOT_PCT / VL_WARN_PCT check: an integer value carrying a control character
+      falls back to its default here exactly as it does in statusline.ps1. The
+      function definitions in that range (Get-BoundedInt, Try-BoundedDouble,
+      Test-Color) are skipped here; Get-OmpState defines the ones it uses from
+      statusline.ps1 by name.
     .PARAMETER Ast
       Parsed statusline.ps1.
     .EXAMPLE

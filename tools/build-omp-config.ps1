@@ -350,19 +350,30 @@ if (-not [string]::IsNullOrEmpty($resolvedConfig) -and [System.IO.File]::Exists(
         [Console]::Error.WriteLine('warning: ' + $resolvedConfig + ' was rejected by the coralline parser; using defaults')
     }
 }
-foreach ($key in @($Cfg.Keys)) { $Cfg[$key] = Remove-ControlChars ([string]$Cfg[$key]) }
 
 # ---- 3. Normalisation, in statusline.ps1's order -----------------------------------
-$Cfg.VL_BAR_WIDTH = [string](Get-BoundedInt $Cfg.VL_BAR_WIDTH ([int]$Defaults.VL_BAR_WIDTH) 0 64)
-$Cfg.VL_PATH_DEPTH = [string](Get-BoundedInt $Cfg.VL_PATH_DEPTH ([int]$Defaults.VL_PATH_DEPTH) 1 256)
-$Cfg.VL_NAME_MAX = [string](Get-BoundedInt $Cfg.VL_NAME_MAX ([int]$Defaults.VL_NAME_MAX) 0 4096)
-$Cfg.VL_COST_DECIMALS = [string](Get-BoundedInt $Cfg.VL_COST_DECIMALS ([int]$Defaults.VL_COST_DECIMALS) 0 9)
-$Cfg.VL_WARN_PCT = [string](Get-BoundedInt $Cfg.VL_WARN_PCT ([int]$Defaults.VL_WARN_PCT) 0 100)
-$Cfg.VL_HOT_PCT = [string](Get-BoundedInt $Cfg.VL_HOT_PCT ([int]$Defaults.VL_HOT_PCT) 0 100)
+# Each integer statement below is statusline.ps1's own statement, character for
+# character, MaxLen included: Get-BoundedInt is taken from statusline.ps1, and a
+# missing MaxLen argument would reach its \A[0-9]{1,MaxLen}\z check as 0.
+# statusline.ps1 also normalises VL_MAX_LINES, VL_WRAP_MARGIN,
+# CORALLINE_BURN_WINDOW, BURN_TRIM and BURN_SLACK here. The generator leaves them
+# out: the fixed layout reads neither VL_MAX_LINES nor VL_WRAP_MARGIN, and the
+# burn knobs are read by statusline-omp.ps1 at render time, through statusline.ps1's
+# own config statements.
+$Cfg.VL_BAR_WIDTH = [string](Get-BoundedInt $Cfg.VL_BAR_WIDTH ([int]$Defaults.VL_BAR_WIDTH) 0 64 2)
+$Cfg.VL_PATH_DEPTH = [string](Get-BoundedInt $Cfg.VL_PATH_DEPTH ([int]$Defaults.VL_PATH_DEPTH) 1 256 3)
+$Cfg.VL_NAME_MAX = [string](Get-BoundedInt $Cfg.VL_NAME_MAX ([int]$Defaults.VL_NAME_MAX) 0 4096 4)
+$Cfg.VL_COST_DECIMALS = [string](Get-BoundedInt $Cfg.VL_COST_DECIMALS ([int]$Defaults.VL_COST_DECIMALS) 0 9 1)
+$Cfg.VL_WARN_PCT = [string](Get-BoundedInt $Cfg.VL_WARN_PCT ([int]$Defaults.VL_WARN_PCT) 0 100 3)
+$Cfg.VL_HOT_PCT = [string](Get-BoundedInt $Cfg.VL_HOT_PCT ([int]$Defaults.VL_HOT_PCT) 0 100 3)
 if ([int]$Cfg.VL_HOT_PCT -lt [int]$Cfg.VL_WARN_PCT) {
     $Cfg.VL_WARN_PCT = $Defaults.VL_WARN_PCT
     $Cfg.VL_HOT_PCT = $Defaults.VL_HOT_PCT
 }
+# Control characters go only now, after the integer checks, where statusline.ps1
+# strips them: an integer value such as $'9\r' falls back to its default, as it
+# does in statusline.ps1 and in Bash, instead of being stripped to 9 first.
+foreach ($key in @($Cfg.Keys)) { $Cfg[$key] = Remove-ControlChars ([string]$Cfg[$key]) }
 foreach ($key in @($Cfg.Keys | Where-Object { $_ -like 'VL_BG_*' -or $_ -like 'VL_FG_*' })) {
     if (-not (Test-Color $Cfg[$key])) { $Cfg[$key] = $Defaults[$key] }
 }
