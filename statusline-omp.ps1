@@ -212,6 +212,115 @@ function Get-FloatConfigPath {
     return $FloatConfigPath
 }
 
+function Get-AutoConfigPath {
+    <#
+    .SYNOPSIS
+      The VL_LAYOUT=auto config this render uses: always coralline.auto.omp.json next to the main config.
+    .DESCRIPTION
+      Y1/Y5: unlike Get-FloatConfigPath, there is no -AutoConfig parameter and no
+      CORALLINE_OMP_AUTO_CONFIG environment variable; the auto path is derived only
+      from the main config, so it cannot be pointed anywhere else. Returns '' when
+      the derivation itself fails (GetFullPath throws on MainConfig), in which case
+      the caller must not use auto and must not add anything to either protected
+      path set for it.
+    .PARAMETER MainConfig
+      Validated main config.
+    .EXAMPLE
+      Get-AutoConfigPath -MainConfig .\coralline.omp.json
+    #>
+    param([string]$MainConfig)
+    $autoConfigPath = ''
+    try {
+        $autoConfigPath = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($MainConfig)), 'coralline.auto.omp.json')
+    } catch { $autoConfigPath = '' }
+    return $autoConfigPath
+}
+
+function ConvertTo-AutoBgMap {
+    <#
+    .SYNOPSIS
+      var.CorallineAutoBgs from a parsed auto config (nested PSCustomObject) as a Hashtable of Hashtables.
+    .DESCRIPTION
+      ConvertFrom-Json has no -AsHashtable parameter on PowerShell 5.1, so nested
+      objects decode as PSCustomObject; this walks them into plain Hashtables so
+      Invoke-OmpAuto can use .Contains() the same way on 5.1 and 7.
+    .PARAMETER Raw
+      $parsed.var.CorallineAutoBgs, or $null.
+    .EXAMPLE
+      ConvertTo-AutoBgMap -Raw $parsed.var.CorallineAutoBgs
+    #>
+    param($Raw)
+    $map = @{}
+    if ($null -eq $Raw) { return $map }
+    foreach ($outer in $Raw.PSObject.Properties) {
+        $inner = @{}
+        foreach ($entry in $outer.Value.PSObject.Properties) { $inner[[string]$entry.Name] = [string]$entry.Value }
+        $map[[string]$outer.Name] = $inner
+    }
+    return $map
+}
+
+function Select-StatuslineDisplayStage {
+    <#
+    .SYNOPSIS
+      statusline.ps1's 38-statement display stage (L715-818: VL_BAR_WIDTH's bound to $Norm, v0.18.0's three BURN_* knobs and the Remove-ControlChars pass included), as one script text, or $null.
+    .DESCRIPTION
+      W1: the 38 statements must be consecutive at EndBlock top level, each
+      matched in order against a fixed list of opening-text anchors (Ordinal
+      StartsWith; the last anchor is the full, exact statement text). The first
+      and last anchors must each occur exactly once among all top-level
+      statements, and there must be exactly 38 statements between them: a
+      statement inserted, removed, reordered or renamed anywhere in the range
+      returns $null rather than running a shifted or partial selection. No node
+      in range may hold an exit statement or call [Environment]::Exit.
+    .PARAMETER Ast
+      Parsed statusline.ps1.
+    .EXAMPLE
+      Select-StatuslineDisplayStage -Ast (Get-StatuslineAst)
+    #>
+    param($Ast)
+    try {
+        $anchors = @(
+            "`$Cfg.VL_BAR_WIDTH = ", "`$Cfg.VL_PATH_DEPTH = ", "`$Cfg.VL_NAME_MAX = ", "`$Cfg.VL_COST_DECIMALS = ",
+            "`$Cfg.VL_WARN_PCT = ", "`$Cfg.VL_HOT_PCT = ", "`$Cfg.VL_MAX_LINES = ", "`$Cfg.VL_WRAP_MARGIN = ",
+            "`$Cfg.CORALLINE_BURN_WINDOW = ", "`$Cfg.BURN_TRIM = ", "`$Cfg.BURN_SLACK = ",
+            "if ([int]`$Cfg.VL_HOT_PCT -lt [int]`$Cfg.VL_WARN_PCT)",
+            "foreach (`$key in @(`$Cfg.Keys)) { `$Cfg[`$key] = Remove-ControlChars",
+            "foreach (`$key in @(`$Cfg.Keys | Where-Object",
+            "foreach (`$key in @('_VL_SUB_BG_NAME'", "if (-not (Test-Color `$Cfg.VL_LEAN_BG)) { `$Cfg.VL_LEAN_BG = '' }",
+            "if (-not (Test-Color `$Cfg.VL_LEAN_FG)) { `$Cfg.VL_LEAN_FG = '' }", "`$Cfg.VL_STYLE = switch -CaseSensitive",
+            "`$Cfg.VL_LAYOUT = switch -CaseSensitive", "`$stockSubFingerprint = '81,166,199|231|114|167|245'",
+            "`$stockSubBar = '|'", "`$candidateFingerprint = `$stockSubFingerprint", "`$candidateBar = `$stockSubBar",
+            "if (`$ConfigAssignments.Contains('_VL_SUB_FP'))", "if (`$ConfigAssignments.Contains('_VL_SUB_BAR'))",
+            "`$adoptSubPalette = -not `$ConfigAssignments.Contains('VL_BG_SUB_NAME')", "if (`$Cfg.VL_STYLE -ceq 'lean')",
+            "`$liveSubFingerprint = ", "if (`$liveSubFingerprint -cne `$candidateFingerprint)", "if (`$adoptSubPalette) {",
+            "if (`$Cfg.VL_ASCII -eq '1')", "if (`$Cfg.VL_STYLE -eq 'classic')", "if (`$Cfg.VL_STYLE -eq 'lean')",
+            "`$NoColor = `$Cfg.VL_NOCOLOR -eq '1'", "`$Esc = [char]27", "`$Rst = `"`$Esc[0m`"", "`$Bold = `"`$Esc[1m`"", "`$Norm = `"`$Esc[22m`""
+        )
+        $statements = $Ast.EndBlock.Statements
+        $firstCount = 0
+        $firstAt = -1
+        $lastCount = 0
+        $lastAt = -1
+        for ($i = 0; $i -lt $statements.Count; $i++) {
+            $text = [string]$statements[$i].Extent.Text
+            if ($text.StartsWith($anchors[0], [System.StringComparison]::Ordinal)) { $firstCount++; $firstAt = $i }
+            if ([string]::Equals($text, $anchors[37], [System.StringComparison]::Ordinal)) { $lastCount++; $lastAt = $i }
+        }
+        if ($firstCount -ne 1 -or $lastCount -ne 1 -or $lastAt -ne $firstAt + 37) { return $null }
+        $nodes = New-Object 'System.Collections.Generic.List[object]'
+        $code = New-Object System.Text.StringBuilder
+        for ($k = 0; $k -lt 38; $k++) {
+            $statement = $statements[$firstAt + $k]
+            if (-not ([string]$statement.Extent.Text).StartsWith($anchors[$k], [System.StringComparison]::Ordinal)) { return $null }
+            [void]$code.AppendLine($statement.Extent.Text)
+            [void]$nodes.Add($statement)
+        }
+        if (-not (Test-NoExitCode $nodes.ToArray())) { return $null }
+        return $code.ToString()
+    } catch { return $null }
+}
+
 function Get-StatuslineAst {
     <#
     .SYNOPSIS
@@ -785,13 +894,17 @@ function Get-OmpState {
       Main Oh-My-Posh config of this render.
     .PARAMETER FloatConfigPath
       Float Oh-My-Posh config of this render.
+    .PARAMETER AutoConfigPath
+      Y1/Y5: VL_LAYOUT=auto config of this render, from Get-AutoConfigPath, added
+      to the state layer's own protected-path set alongside the other files this
+      wrapper owns; possibly empty, which adds nothing.
     .PARAMETER ExePath
       Oh-My-Posh executable of this render.
     .EXAMPLE
-      Get-OmpState -FiveHourPct '40' -FiveHourReset '1790009030' -SevenDayPct '' -SevenDayReset '' -MainConfig .\coralline.omp.json -FloatConfigPath .\coralline.float.omp.json -ExePath .\oh-my-posh.exe
+      Get-OmpState -FiveHourPct '40' -FiveHourReset '1790009030' -SevenDayPct '' -SevenDayReset '' -MainConfig .\coralline.omp.json -FloatConfigPath .\coralline.float.omp.json -AutoConfigPath .\coralline.auto.omp.json -ExePath .\oh-my-posh.exe
     #>
     param([string]$FiveHourPct, [string]$FiveHourReset, [string]$SevenDayPct, [string]$SevenDayReset,
-        [string]$MainConfig, [string]$FloatConfigPath, [string]$ExePath)
+        [string]$MainConfig, [string]$FloatConfigPath, [string]$AutoConfigPath, [string]$ExePath)
     # Local names carry an omp prefix: the extracted code resolves free variables
     # dynamically, and none of its own names may be shadowed from here.
     $ompAst = Get-StatuslineAst
@@ -857,7 +970,7 @@ function Get-OmpState {
     # the full path a state path resolves to. The HashSet $visited, which
     # Import-ConfigFile uses for include cycles, is left alone.
     if ($ConfigVisitedPaths -is [array]) {
-        foreach ($ompProtected in @($WrapperPath, $GeneratorPath, $MainConfig, $FloatConfigPath, $ExePath)) {
+        foreach ($ompProtected in @($WrapperPath, $GeneratorPath, $MainConfig, $FloatConfigPath, $AutoConfigPath, $ExePath)) {
             if ([string]::IsNullOrEmpty([string]$ompProtected)) { continue }
             $ConfigVisitedPaths += [string]$ompProtected
             $ompFull = ConvertTo-LocalFullPath ([string]$ompProtected) ([Environment]::CurrentDirectory)
@@ -996,6 +1109,41 @@ function Get-OmpState {
         $ompResult.BurnTone = ''
         $ompResult.BurnEta = ''
     }
+
+    # ---- W1/W2: display stage, on a copy of $Cfg so the state layer's and float's own
+    # $Cfg above are untouched. Anything that fails leaves Display $null; the auto path
+    # then always retreats to the one-row fixed render.
+    $ompResult.Display = $null
+    try {
+        $ompDisplayCode = Select-StatuslineDisplayStage $ompAst
+        if ($null -ne $ompDisplayCode) {
+            $ompDisplayResult = & {
+                $Cfg = Copy-Config $Cfg
+                $ErrorActionPreference = 'SilentlyContinue'
+                $NoColor = $null; $Esc = $null; $Rst = $null; $Bold = $null; $Norm = $null
+                $stockSubFingerprint = $null; $stockSubBar = $null; $candidateFingerprint = $null; $candidateBar = $null
+                $adoptSubPalette = $null; $liveSubFingerprint = $null
+                . ([scriptblock]::Create($ompDisplayCode))
+                $ok = $true
+                if ($Esc -cne [string][char]27) { $ok = $false }
+                if ($Rst -cne "$([char]27)[0m") { $ok = $false }
+                if ($Bold -cne "$([char]27)[1m") { $ok = $false }
+                if ($Norm -cne "$([char]27)[22m") { $ok = $false }
+                if ($NoColor -isnot [bool] -or $NoColor -ne ($Cfg.VL_NOCOLOR -eq '1')) { $ok = $false }
+                if (@('lean', 'pill') -cnotcontains [string]$Cfg.VL_STYLE) { $ok = $false }
+                if (@('fixed', 'auto') -cnotcontains [string]$Cfg.VL_LAYOUT) { $ok = $false }
+                $maxLines = 0
+                if (-not [int]::TryParse([string]$Cfg.VL_MAX_LINES, $IntegerStyle, $Invariant, [ref]$maxLines) -or $maxLines -lt 1 -or $maxLines -gt 64) { $ok = $false }
+                $wrapMargin = 0
+                if (-not [int]::TryParse([string]$Cfg.VL_WRAP_MARGIN, $IntegerStyle, $Invariant, [ref]$wrapMargin) -or $wrapMargin -lt 0 -or $wrapMargin -gt 32767) { $ok = $false }
+                if (-not $ok) { return $null }
+                $cfgMap = [ordered]@{}
+                foreach ($cfgKey in @($Cfg.Keys)) { $cfgMap[[string]$cfgKey] = [string]$Cfg[$cfgKey] }
+                return @{ Cfg = $cfgMap; Esc = [string]$Esc; Rst = [string]$Rst; Bold = [string]$Bold; Norm = [string]$Norm; NoColor = [bool]$NoColor }
+            }
+            if ($null -ne $ompDisplayResult) { $ompResult.Display = $ompDisplayResult }
+        }
+    } catch { $ompResult.Display = $null }
     return $ompResult
 }
 
@@ -1104,6 +1252,10 @@ function Invoke-OmpFloat {
       Validated main config.
     .PARAMETER FloatConfigPath
       Float config from Get-FloatConfigPath.
+    .PARAMETER AutoConfigPath
+      Y1/Y5: VL_LAYOUT=auto config from Get-AutoConfigPath, joining the explicit
+      collision set below alongside the other files this wrapper owns; possibly
+      empty, which adds nothing.
     .PARAMETER Payload
       The stdin bytes the main render received.
     .PARAMETER Environment
@@ -1111,9 +1263,9 @@ function Invoke-OmpFloat {
     .PARAMETER Context
       Result of Get-OmpState; without one no float file is written.
     .EXAMPLE
-      Invoke-OmpFloat -ExePath $OmpExe -MainConfig $Config -FloatConfigPath $FloatConfig -Payload $payloadBytes -Environment $envMap -Context $ompState
+      Invoke-OmpFloat -ExePath $OmpExe -MainConfig $Config -FloatConfigPath $FloatConfig -AutoConfigPath $AutoConfig -Payload $payloadBytes -Environment $envMap -Context $ompState
     #>
-    param([string]$ExePath, [string]$MainConfig, [string]$FloatConfigPath, [byte[]]$Payload, $Environment, $Context)
+    param([string]$ExePath, [string]$MainConfig, [string]$FloatConfigPath, [string]$AutoConfigPath, [byte[]]$Payload, $Environment, $Context)
     if ($null -eq $Context -or $Context.Cfg -isnot [System.Collections.IDictionary]) { return }
     $ast = Get-StatuslineAst
     if ($null -eq $ast) { return }
@@ -1165,7 +1317,7 @@ function Invoke-OmpFloat {
     if ([string]::IsNullOrEmpty($target)) { return }
 
     # Explicit collision set, independent of $ScriptPath above.
-    $protected = @($StatuslinePath, $WrapperPath, $GeneratorPath, $MainConfig, $FloatConfigPath, $ExePath)
+    $protected = @($StatuslinePath, $WrapperPath, $GeneratorPath, $MainConfig, $FloatConfigPath, $AutoConfigPath, $ExePath)
     foreach ($path in $protected) {
         if ([string]::IsNullOrEmpty([string]$path)) { continue }
         if ($target.Equals([string]$path, [System.StringComparison]::OrdinalIgnoreCase)) { return }
@@ -1234,6 +1386,198 @@ function Invoke-OmpFloat {
     [void](Write-FloatAtomic $target $bytes)
 }
 
+function Invoke-OmpAuto {
+    <#
+    .SYNOPSIS
+      Render VL_LAYOUT=auto from an Oh-My-Posh auto-config render, wrapped the way statusline.ps1's own auto layout wraps it; $null retreats to the fixed render.
+    .DESCRIPTION
+      ② decodes with StrictUtf8. ③ checks the P2 structure: exactly N+1 U+FDD0
+      <k> U+FDD1 markers, k in order 0..N, nothing before the first or after the
+      last, and the total U+FDD0/U+FDD1 count in the whole output matches N+1
+      each (a payload value forging a bare marker fails this). ④ walks the N
+      per-token pieces: empty pieces are skipped; a P3 variant (U+FDD2..U+FDD3)
+      is required exactly once for a non-empty git or project piece, from the
+      allowed set for that token, and forbidden for any other token; the
+      variant, or '' when none, looks up this token's background in Bgs, a miss
+      retreats. ⑤ runs statusline.ps1's own auto-layout statements (V2:
+      Build-Segments's own first call is skipped, since $SegBgs/$SegTxt/$SegLen
+      are already filled by ④; the rest, including the wrapping loop and
+      Render-Range calls, run verbatim) against a StringWriter, so nothing
+      reaches the caller until the whole layout has run without error.
+    .PARAMETER RawBytes
+      stdout bytes from the auto Oh-My-Posh render.
+    .PARAMETER Tokens
+      CorallineAutoTokens from the auto config: the full VL_SEGMENTS token list.
+    .PARAMETER Bgs
+      CorallineAutoBgs from the auto config (ConvertTo-AutoBgMap's shape): token
+      index (as string) -> variant ('' when the token carries none) -> coralline
+      colour spec.
+    .PARAMETER Display
+      Get-OmpState's Display: the normalised $Cfg copy plus Esc/Rst/Bold/Norm/NoColor.
+    .PARAMETER Ast
+      Parsed statusline.ps1.
+    .EXAMPLE
+      Invoke-OmpAuto -RawBytes $bytes -Tokens @('model','dir') -Bgs $bgMap -Display $ompState.Display -Ast (Get-StatuslineAst)
+    #>
+    param([byte[]]$RawBytes, [object[]]$Tokens, $Bgs, $Display, $Ast)
+    try {
+        if ($null -eq $Display -or $null -eq $Ast -or $null -eq $Bgs) { return $null }
+        $gitVariants = @('ok', 'dirty')
+        $projectVariants = @('proj', 'dir')
+
+        # ---- ⑥ functions Render-Range/Get-Fg/Get-Bg/Get-ScalarCount/Get-TerminalColumns/
+        # Get-DisplayWidth/Remove-Sgr/Get-SegmentTokens, each defined exactly once at
+        # script level (Select-StatuslineFunctions), dot-sourced into this function.
+        $autoNames = @('Render-Range', 'Get-Fg', 'Get-Bg', 'Get-ScalarCount', 'Get-TerminalColumns', 'Get-DisplayWidth', 'Remove-Sgr', 'Get-SegmentTokens', 'Test-Color')
+        $autoDefinitions = Select-StatuslineFunctions $Ast $autoNames
+        if ($null -eq $autoDefinitions) { return $null }
+        foreach ($definition in $autoDefinitions) { . ([scriptblock]::Create($definition.Extent.Text)) }
+        foreach ($defName in $autoNames) { if (-not (Get-Command -Name $defName -CommandType Function -ErrorAction SilentlyContinue)) { return $null } }
+
+        # ---- V2: across every EndBlock top-level TryStatement's Body, the one unique
+        # `$Cfg.VL_LAYOUT -eq 'auto'` then-block, with its own first statement
+        # (Build-Segments) skipped. statusline.ps1 has more than one top-level try, so
+        # this is the unique matching IfStatementAst among all of them, not "the" try.
+        $tryNodes = @($Ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] })
+        if ($tryNodes.Count -lt 1) { return $null }
+        $ifNodes = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($tryNode in $tryNodes) {
+            foreach ($candidate in @($tryNode.Body.FindAll({
+                            param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and [string]::Equals([string]$n.Clauses[0].Item1.Extent.Text, "`$Cfg.VL_LAYOUT -eq 'auto'", [System.StringComparison]::Ordinal)
+                        }, $true))) { [void]$ifNodes.Add($candidate) }
+        }
+        if ($ifNodes.Count -ne 1) { return $null }
+        $thenStatements = $ifNodes[0].Clauses[0].Item2.Statements
+        if ($thenStatements.Count -lt 2) { return $null }
+        if (-not [string]::Equals([string]$thenStatements[0].Extent.Text, "Build-Segments ([string]`$Cfg.VL_SEGMENTS)", [System.StringComparison]::Ordinal)) { return $null }
+        $layoutNodes = New-Object 'System.Collections.Generic.List[object]'
+        $layoutCode = New-Object System.Text.StringBuilder
+        for ($i = 1; $i -lt $thenStatements.Count; $i++) {
+            [void]$layoutCode.AppendLine($thenStatements[$i].Extent.Text)
+            [void]$layoutNodes.Add($thenStatements[$i])
+        }
+        if (-not (Test-NoExitCode $layoutNodes.ToArray())) { return $null }
+
+        # ---- ② decode --------------------------------------------------------------------
+        $decoded = $null
+        try { $decoded = $StrictUtf8.GetString($RawBytes) } catch { return $null }
+
+        # ---- ③ structure (P2) -------------------------------------------------------------
+        # P1: the marker segment carries no foreground of its own, so Oh-My-Posh (P5)
+        # wraps it in the default ESC[37m .. ESC[0m; P2's own cut regex matches that
+        # whole wrapped unit, not the bare marker characters, so a genuine marker is
+        # told apart from a forged bare U+FDD0/U+FDD1 inside some other segment's text.
+        $n = @($Tokens).Count
+        $markerRegex = [regex]::new([string][char]27 + '\[37m' + [string][char]0xFDD0 + '([0-9]+)' + [string][char]0xFDD1 + [string][char]27 + '\[0m')
+        $markerMatches = @($markerRegex.Matches($decoded))
+        if ($markerMatches.Count -ne ($n + 1)) { return $null }
+        if ($markerMatches[0].Index -ne 0) { return $null }
+        for ($k = 0; $k -le $n; $k++) {
+            $digits = $markerMatches[$k].Groups[1].Value
+            if (-not [string]::Equals($digits, $k.ToString($Invariant), [System.StringComparison]::Ordinal)) { return $null }
+        }
+        # Total raw U+FDD0/U+FDD1 occurrences anywhere in the output, matched or not,
+        # must be exactly N+1 each: a payload value forging a bare marker outside a
+        # genuine wrapped unit pushes this over and fails closed.
+        $openTotal = 0
+        $closeTotal = 0
+        foreach ($ch in $decoded.ToCharArray()) {
+            if ([int]$ch -eq 0xFDD0) { $openTotal++ }
+            elseif ([int]$ch -eq 0xFDD1) { $closeTotal++ }
+        }
+        if ($openTotal -ne ($n + 1) -or $closeTotal -ne ($n + 1)) { return $null }
+        $pieces = New-Object 'System.Collections.Generic.List[string]'
+        for ($k = 0; $k -le $n; $k++) {
+            $bodyStart = $markerMatches[$k].Index + $markerMatches[$k].Length
+            $bodyEnd = $decoded.Length
+            if ($k -lt $n) { $bodyEnd = $markerMatches[$k + 1].Index }
+            [void]$pieces.Add($decoded.Substring($bodyStart, $bodyEnd - $bodyStart))
+        }
+        # Nothing after the terminator marker (index N)'s close.
+        if ($pieces[$n].Length -ne 0) { return $null }
+
+        # ---- ④ per-segment processing -----------------------------------------------------
+        $variantCharTotal = 0
+        foreach ($ch in $decoded.ToCharArray()) { if ([int]$ch -eq 0xFDD2 -or [int]$ch -eq 0xFDD3) { $variantCharTotal++ } }
+        $variantCharSeen = 0
+        $Cfg = $Display.Cfg
+        $Esc = $Display.Esc
+        $Rst = $Display.Rst
+        $Bold = $Display.Bold
+        $Norm = $Display.Norm
+        $NoColor = $Display.NoColor
+        $SegBgs = New-Object 'System.Collections.Generic.List[string]'
+        $SegTxt = New-Object 'System.Collections.Generic.List[string]'
+        $SegLen = New-Object 'System.Collections.Generic.List[int]'
+        for ($k = 0; $k -lt $n; $k++) {
+            $piece = [string]$pieces[$k]
+            if ([string]::IsNullOrEmpty($piece)) { continue }
+            $openMarks = 0
+            $closeMarks = 0
+            $openIdx = -1
+            $closeIdx = -1
+            for ($ci = 0; $ci -lt $piece.Length; $ci++) {
+                switch ([int]$piece[$ci]) {
+                    0xFDD2 { $openMarks++; $openIdx = $ci; break }
+                    0xFDD3 { $closeMarks++; $closeIdx = $ci; break }
+                }
+            }
+            $variant = ''
+            switch ($true) {
+                ($openMarks -eq 0 -and $closeMarks -eq 0) { break }
+                ($openMarks -eq 1 -and $closeMarks -eq 1 -and $closeIdx -gt $openIdx) {
+                    $variant = $piece.Substring($openIdx + 1, $closeIdx - $openIdx - 1)
+                    # Remove the whole U+FDD2 .. U+FDD3 unit, not just its two delimiter
+                    # characters: the variant word itself (e.g. "proj", "dirty") sits
+                    # between them and is not part of the rendered segment text.
+                    $piece = $piece.Remove($openIdx, $closeIdx - $openIdx + 1)
+                    $variantCharSeen += 2
+                    break
+                }
+                default { return $null }
+            }
+            $tokenName = [string]$Tokens[$k]
+            switch ($tokenName) {
+                'git' { if ($gitVariants -cnotcontains $variant) { return $null } }
+                'project' { if ($projectVariants -cnotcontains $variant) { return $null } }
+                default { if ($variant -cne '') { return $null } }
+            }
+            $bgKey = [string]$k
+            if (-not $Bgs.Contains($bgKey)) { return $null }
+            $variantMap = $Bgs[$bgKey]
+            # 'none' on the wire (ConvertTo-AutoBgMap's keys): the sentinel the generator
+            # writes for a token that carries no P3 variant, since ConvertFrom-Json cannot
+            # round-trip an empty PSCustomObject property name.
+            $lookupVariant = $(if ($variant -ceq '') { 'none' } else { $variant })
+            if ($variantMap -isnot [System.Collections.IDictionary] -or -not $variantMap.Contains($lookupVariant)) { return $null }
+            $bg = [string]$variantMap[$lookupVariant]
+            # Y4 (security-reviewer F3): Test-Color alone is not enough (it accepts '',
+            # and its -match leaves a trailing "\n" through the implicit $ anchor), so
+            # every baked background must also be non-empty and match this strict,
+            # case-sensitive, fully-anchored spec pattern before it reaches $SegBgs -
+            # from there Get-Bg inserts it into an SGR sequence unescaped, exactly as
+            # statusline.ps1's own $SegBgs values always do (Remove-ControlChars plus
+            # Test-Color at config-load time already guarantee this for every value the
+            # native renderer ever puts there).
+            if ([string]::IsNullOrEmpty($bg) -or $bg -cnotmatch '\A[0-9]{1,3}(,[0-9]{1,3},[0-9]{1,3})?\z' -or -not (Test-Color $bg)) { return $null }
+            [void]$SegBgs.Add($bg)
+            [void]$SegTxt.Add($piece)
+            [void]$SegLen.Add((Get-DisplayWidth $piece))
+        }
+        if ($variantCharSeen -ne $variantCharTotal) { return $null }
+
+        # ---- ⑤ layout: statusline.ps1's own code (Build-Segments's own call skipped) ------
+        $total = $SegBgs.Count
+        $OutputWriter = New-Object System.IO.StringWriter
+        $OutputWriter.NewLine = "`n"
+        try {
+            $ErrorActionPreference = 'Stop'
+            . ([scriptblock]::Create($layoutCode.ToString()))
+        } catch { return $null }
+        return $Utf8NoBom.GetBytes($OutputWriter.ToString())
+    } catch { return $null }
+}
+
 # ---- stdin, read the way statusline.ps1 reads it -------------------------------------
 $buffer = New-Object System.IO.MemoryStream
 try { [Console]::OpenStandardInput().CopyTo($buffer) } catch { }
@@ -1261,6 +1605,7 @@ if ([string]::IsNullOrEmpty($OmpExe)) {
 }
 if ([string]::IsNullOrEmpty($OmpExe) -or -not [System.IO.File]::Exists($OmpExe)) { Exit-Blank }
 $FloatConfig = Get-FloatConfigPath -MainConfig $Config -FloatConfigPath $FloatConfig
+$AutoConfig = Get-AutoConfigPath -MainConfig $Config
 
 # ---- normalise, falling back to the raw stdin ----------------------------------------
 $payloadBytes = $rawBytes
@@ -1270,7 +1615,7 @@ $result = Get-OmpEnvironment $decoded
 if ($result -is [hashtable] -and $result.Payload -is [System.Collections.IDictionary]) {
     # Not inside try: see Get-OmpState.
     $ompState = Get-OmpState -FiveHourPct $result.FhPct -FiveHourReset $result.FhRst -SevenDayPct $result.WdPct -SevenDayReset $result.WdRst `
-        -MainConfig $Config -FloatConfigPath $FloatConfig -ExePath $OmpExe
+        -MainConfig $Config -FloatConfigPath $FloatConfig -AutoConfigPath $AutoConfig -ExePath $OmpExe
     try {
         if ($null -ne $ompState -and $ompState.LimitSync -eq $true) {
             # VL_LIMIT_SYNC=1: the gauges show the synced windows, or hide.
@@ -1296,13 +1641,56 @@ if ($result -is [hashtable] -and $result.Payload -is [System.Collections.IDictio
 }
 
 # ---- render ---------------------------------------------------------------------------
-$mainBytes = [byte[]](10)
+# VL_LAYOUT=auto: one Oh-My-Posh call on the auto config when everything this render
+# needs lines up (S5 (1)); any check or step failing anywhere below falls back to the
+# ordinary single-row Invoke-Omp call on $Config, at most one extra Oh-My-Posh call.
+# Get-SegmentTokens is dot-sourced here, at script scope, for the ① precheck below:
+# Get-OmpState only dot-sources its own copy into its own function scope.
 try {
-    $rendered = Invoke-Omp $OmpExe $Config $payloadBytes $envMap
-    if ($null -ne $rendered) { $mainBytes = $rendered }
+    $AutoTokenFnAst = Get-StatuslineAst
+    if ($null -ne $AutoTokenFnAst) {
+        $AutoTokenFnDefs = Select-StatuslineFunctions $AutoTokenFnAst @('Get-SegmentTokens')
+        if ($null -ne $AutoTokenFnDefs) { foreach ($AutoTokenFnDef in $AutoTokenFnDefs) { . ([scriptblock]::Create($AutoTokenFnDef.Extent.Text)) } }
+    }
 } catch { }
+$mainBytes = [byte[]](10)
+$autoDone = $false
+try {
+    if ($null -ne $ompState -and $ompState.Display -is [System.Collections.IDictionary] -and
+        (Get-Command -Name 'Get-SegmentTokens' -CommandType Function -ErrorAction SilentlyContinue) -and
+        [string]$ompState.Display.Cfg.VL_LAYOUT -ceq 'auto' -and $ompState.Display.NoColor -eq $false -and
+        (Test-OmpConfig $AutoConfig)) {
+        $autoParsed = $StrictUtf8.GetString([System.IO.File]::ReadAllBytes($AutoConfig)) | ConvertFrom-Json -ErrorAction Stop
+        $autoTokens = @($autoParsed.var.CorallineAutoTokens)
+        $autoStyle = [string]$autoParsed.var.CorallineAutoStyle
+        # ① precheck: the tokens and style this render's own config would build must be
+        # exactly what the auto config was generated for.
+        $displayTokens = @(Get-SegmentTokens ([string]$ompState.Display.Cfg.VL_SEGMENTS))
+        $tokensMatch = ($displayTokens.Count -eq $autoTokens.Count)
+        if ($tokensMatch) {
+            for ($ti = 0; $ti -lt $displayTokens.Count; $ti++) {
+                if (-not [string]::Equals([string]$displayTokens[$ti], [string]$autoTokens[$ti], [System.StringComparison]::Ordinal)) { $tokensMatch = $false; break }
+            }
+        }
+        $styleMatch = [string]::Equals($autoStyle, [string]$ompState.Display.Cfg.VL_STYLE, [System.StringComparison]::Ordinal)
+        if ($tokensMatch -and $styleMatch) {
+            $autoRendered = Invoke-Omp $OmpExe $AutoConfig $payloadBytes $envMap
+            if ($null -ne $autoRendered) {
+                $autoBgsMap = ConvertTo-AutoBgMap $autoParsed.var.CorallineAutoBgs
+                $autoBytes = Invoke-OmpAuto -RawBytes $autoRendered -Tokens $autoTokens -Bgs $autoBgsMap -Display $ompState.Display -Ast (Get-StatuslineAst)
+                if ($null -ne $autoBytes) { $mainBytes = $autoBytes; $autoDone = $true }
+            }
+        }
+    }
+} catch { $autoDone = $false }
+if (-not $autoDone) {
+    try {
+        $rendered = Invoke-Omp $OmpExe $Config $payloadBytes $envMap
+        if ($null -ne $rendered) { $mainBytes = $rendered }
+    } catch { }
+}
 Write-Bytes $mainBytes
 
 # ---- float, after the statusline is out; a failure never reaches stdout or the exit code
-try { Invoke-OmpFloat $OmpExe $Config $FloatConfig $payloadBytes $envMap $ompState } catch { }
+try { Invoke-OmpFloat $OmpExe $Config $FloatConfig $AutoConfig $payloadBytes $envMap $ompState } catch { }
 exit 0

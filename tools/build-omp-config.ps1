@@ -43,6 +43,20 @@
   way statusline.ps1 does. VL_FLOAT_SEGMENTS is baked in and needs a rebuild after
   a change; VL_FLOAT_SEP and VL_FLOAT_FILE are read at render time.
 
+.PARAMETER AutoOutFile
+  Where the VL_LAYOUT=auto config is written; not written when omitted or when the
+  auto config cannot be produced (see below). statusline-omp.ps1 looks for
+  coralline.auto.omp.json next to the main config. One block per VL_SEGMENTS token,
+  each opened by a U+FDD0 <index> U+FDD1 marker plus a closing U+FDD0 <N> U+FDD1
+  terminator, so the wrapper can cut the render into per-segment pieces the way
+  statusline.ps1's own auto layout (Build-Segments / Render-Range) does; a git or
+  project segment also carries a U+FDD2 <variant> U+FDD3 marker naming which
+  background the wrapper must bake in, from var.CorallineAutoBgs (token index ->
+  variant -> coralline colour spec). VL_SEGMENTS is baked in and needs a rebuild
+  after a change. Not produced when VL_NOCOLOR=1, when VL_MAX_LINES resolves to 1
+  or less, or when a background a token needs is the empty string: the wrapper
+  falls back to the one-row fixed config in every such case.
+
 .EXAMPLE
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build-omp-config.ps1 -OutFile "$HOME\.claude\coralline\coralline.omp.json"
 
@@ -56,7 +70,8 @@ param(
     [string]$ConfigPath = '',
     [string]$StatuslinePath = '',
     [string]$OutFile = '',
-    [string]$FloatOutFile = ''
+    [string]$FloatOutFile = '',
+    [string]$AutoOutFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -355,17 +370,20 @@ if (-not [string]::IsNullOrEmpty($resolvedConfig) -and [System.IO.File]::Exists(
 # Each integer statement below is statusline.ps1's own statement, character for
 # character, MaxLen included: Get-BoundedInt is taken from statusline.ps1, and a
 # missing MaxLen argument would reach its \A[0-9]{1,MaxLen}\z check as 0.
-# statusline.ps1 also normalises VL_MAX_LINES, VL_WRAP_MARGIN,
-# CORALLINE_BURN_WINDOW, BURN_TRIM and BURN_SLACK here. The generator leaves them
-# out: the fixed layout reads neither VL_MAX_LINES nor VL_WRAP_MARGIN, and the
-# burn knobs are read by statusline-omp.ps1 at render time, through statusline.ps1's
-# own config statements.
+# statusline.ps1 also normalises VL_WRAP_MARGIN, CORALLINE_BURN_WINDOW,
+# BURN_TRIM and BURN_SLACK here. The generator leaves them out: the fixed
+# layout reads neither VL_MAX_LINES nor VL_WRAP_MARGIN (VL_MAX_LINES is
+# normalised below only because $autoMaxLines, the auto-config gate, needs
+# the same value statusline.ps1's display stage will see), and the burn
+# knobs are read by statusline-omp.ps1 at render time, through
+# statusline.ps1's own config statements.
 $Cfg.VL_BAR_WIDTH = [string](Get-BoundedInt $Cfg.VL_BAR_WIDTH ([int]$Defaults.VL_BAR_WIDTH) 0 64 2)
 $Cfg.VL_PATH_DEPTH = [string](Get-BoundedInt $Cfg.VL_PATH_DEPTH ([int]$Defaults.VL_PATH_DEPTH) 1 256 3)
 $Cfg.VL_NAME_MAX = [string](Get-BoundedInt $Cfg.VL_NAME_MAX ([int]$Defaults.VL_NAME_MAX) 0 4096 4)
 $Cfg.VL_COST_DECIMALS = [string](Get-BoundedInt $Cfg.VL_COST_DECIMALS ([int]$Defaults.VL_COST_DECIMALS) 0 9 1)
 $Cfg.VL_WARN_PCT = [string](Get-BoundedInt $Cfg.VL_WARN_PCT ([int]$Defaults.VL_WARN_PCT) 0 100 3)
 $Cfg.VL_HOT_PCT = [string](Get-BoundedInt $Cfg.VL_HOT_PCT ([int]$Defaults.VL_HOT_PCT) 0 100 3)
+$Cfg.VL_MAX_LINES = [string](Get-BoundedInt $Cfg.VL_MAX_LINES ([int]$Defaults.VL_MAX_LINES) 1 64 2)
 if ([int]$Cfg.VL_HOT_PCT -lt [int]$Cfg.VL_WARN_PCT) {
     $Cfg.VL_WARN_PCT = $Defaults.VL_WARN_PCT
     $Cfg.VL_HOT_PCT = $Defaults.VL_HOT_PCT
@@ -412,9 +430,10 @@ if ($Cfg.VL_STYLE -eq 'lean') {
     $Cfg.VL_CAP_R = ''
     $Cfg.VL_FG_TEXT = $Cfg.VL_LEAN_FG
 }
-if ($Cfg.VL_LAYOUT -eq 'auto') {
-    [Console]::Error.WriteLine('warning: VL_LAYOUT=auto is not supported by the Oh-My-Posh engine yet; rendering VL_SEGMENTS as one fixed row')
-}
+# VL_LAYOUT=auto's own auxiliary config is produced further down (section 5), once
+# $SegmentTemplates and the per-token backgrounds are known; the warning below is
+# printed only when that config could not be produced. The main config above still
+# renders VL_SEGMENTS as one fixed row either way: the wrapper's fallback layout.
 
 # ---- 4. Oh-My-Posh building blocks --------------------------------------------------
 $Lean = $Cfg.VL_STYLE -eq 'lean'
@@ -912,6 +931,148 @@ foreach ($row in $rows) {
 }
 foreach ($name in $unsupported) { [Console]::Error.WriteLine('warning: segment "' + $name + '" is not supported by the Oh-My-Posh engine yet; skipped') }
 
+# ---- 5. VL_LAYOUT=auto: per-token blocks, P1/P3 markers, baked backgrounds ---------
+function New-AutoSegment {
+    <#
+    .SYNOPSIS
+      Oh-My-Posh plain segment for one coralline segment under VL_LAYOUT=auto.
+    .DESCRIPTION
+      style is always plain, with no diamond: the wrapper's own layout code (V2,
+      Render-Range) draws the caps and separators itself. X1: unlike the first
+      cut of this function, background and background_templates (pill) or
+      background (VL_LEAN_BG, lean) are kept exactly as New-OmpSegment's fixed
+      mode sets them. Leaving OMP's own segment background empty made Oh-My-Posh
+      emit a mid-segment ESC[49m at the second of two sibling colour spans in a
+      template (ctx, cache, limit5h, limit7d), which P4 forbids; giving the
+      segment its real background stops OMP from emitting that reset at all,
+      because there is then a real colour to hold instead of "transparent". This
+      also keeps the raw OMP render's own visual background correct for anyone
+      who inspects it directly, even though the wrapper only reads plain text
+      out of it and re-paints the background itself from var.CorallineAutoBgs,
+      keyed by the P3 variant marker the template text carries (the two sources
+      of the same colour cannot disagree: both are baked from the same $Cfg at
+      generation time). foreground is set exactly as P5 requires (OMP always
+      writes some foreground, so it must match coralline's own): VL_FG_TEXT in
+      powerline/pill, the segment's own background colour in lean, or
+      VL_LEAN_FG when that is set (statusline.ps1 L798, which the templates
+      already carry as an inline colour span through Get-TextSpan; this is the
+      outer default that P4/P5 need OMP itself to fall back on).
+    .PARAMETER Spec
+      Entry from $SegmentTemplates (Bg, BgDirty/DirtyCondition, Options, Alias, HideEnv).
+    .PARAMETER Template
+      Template text to use, already carrying any P3 variant marker.
+    .EXAMPLE
+      New-AutoSegment -Spec $SegmentTemplates['model'] -Template $SegmentTemplates['model'].Template
+    #>
+    param($Spec, [string]$Template)
+    $segment = [ordered]@{ type = $Spec.Type; style = 'plain' }
+    $ownBg = ConvertTo-OmpColor $Spec.Bg
+    switch ($Lean) {
+        $true {
+            $leanBg = ConvertTo-OmpColor $Cfg.VL_LEAN_BG
+            $segment.background = $(if ($leanBg) { $leanBg } else { 'transparent' })
+            $ownFg = $(if ($ownBg) { $ownBg } else { 'default' })
+            $segment.foreground = $(if (-not [string]::IsNullOrEmpty($Cfg.VL_LEAN_FG)) { ConvertTo-OmpColor $Cfg.VL_LEAN_FG } else { $ownFg })
+            if ($Spec.ContainsKey('BgDirty')) { $segment.foreground_templates = @('{{ if ' + $Spec.DirtyCondition + ' }}' + (ConvertTo-OmpColor $Spec.BgDirty) + '{{ end }}') }
+        }
+        default {
+            $segment.background = $(if ($ownBg) { $ownBg } else { 'transparent' })
+            $segment.foreground = $(if ($Cfg.VL_FG_TEXT) { ConvertTo-OmpColor $Cfg.VL_FG_TEXT } else { 'default' })
+            if ($Spec.ContainsKey('BgDirty')) { $segment.background_templates = @('{{ if ' + $Spec.DirtyCondition + ' }}' + (ConvertTo-OmpColor $Spec.BgDirty) + '{{ end }}') }
+        }
+    }
+    if ($Spec.ContainsKey('Options')) { $segment.options = $Spec.Options }
+    if ($Spec.ContainsKey('Alias')) { $segment.alias = $Spec.Alias }
+    $body = $Template
+    if ($Spec.ContainsKey('HideEnv')) {
+        $conditions = @($Spec.HideEnv | ForEach-Object { '.Env.' + $_ })
+        $test = $conditions[0]
+        if ($conditions.Count -gt 1) { $test = '(or ' + [string]::Join(' ', $conditions) + ')' }
+        $body = '{{ if not ' + $test + ' }}' + $body + '{{ end }}'
+    }
+    $segment.template = $body
+    return $segment
+}
+
+$autoOpen = [string][char]0xFDD0
+$autoClose = [string][char]0xFDD1
+$variantOpen = [string][char]0xFDD2
+$variantClose = [string][char]0xFDD3
+$autoTokens = @(Get-SegmentTokens ([string]$Cfg.VL_SEGMENTS))
+$autoBlocks = New-Object 'System.Collections.Generic.List[object]'
+$autoBgs = [ordered]@{}
+for ($autoIndex = 0; $autoIndex -lt $autoTokens.Count; $autoIndex++) {
+    $autoName = [string]$autoTokens[$autoIndex]
+    $marker = $autoOpen + $autoIndex.ToString($Invariant) + $autoClose
+    $members = New-Object 'System.Collections.Generic.List[object]'
+    $bgEntry = [ordered]@{}
+    switch ($true) {
+        { $autoName -ceq 'project' } {
+            $projectTemplate = '{{ if .RepoName }}' + $variantOpen + 'proj' + $variantClose + '<b>' +
+                (Get-TextSpan (' ' + (Protect-Markup $Cfg.VL_PROJECT_GLYPH) + ' ' + (Get-TruncTemplate '.RepoName') + ' ')) + '</b>{{ end }}'
+            [void]$members.Add((New-AutoSegment $SegmentTemplates['project'] $projectTemplate))
+            $bgEntry['proj'] = $projectBg
+            if (-not $dirListed) {
+                $fallbackTemplate = '{{ if not (.Segments.Contains "CorallineProject") }}' + $variantOpen + 'dir' + $variantClose + $dirTemplate + '{{ end }}'
+                [void]$members.Add((New-AutoSegment $SegmentTemplates['project-fallback'] $fallbackTemplate))
+                $bgEntry['dir'] = $Cfg.VL_BG_DIR
+            }
+            break
+        }
+        { $autoName -ceq 'project-fallback' } { break }
+        { $SegmentTemplates.Contains($autoName) } {
+            $autoSpec = $SegmentTemplates[$autoName]
+            switch ($autoName -ceq 'git') {
+                $true {
+                    $gitTemplate = $variantOpen + '{{ if ' + $gitDirty + ' }}dirty{{ else }}ok{{ end }}' + $variantClose + $autoSpec.Template
+                    [void]$members.Add((New-AutoSegment $autoSpec $gitTemplate))
+                    $bgEntry['ok'] = $Cfg.VL_BG_GIT_OK
+                    $bgEntry['dirty'] = $Cfg.VL_BG_GIT_DIRTY
+                }
+                default {
+                    [void]$members.Add((New-AutoSegment $autoSpec $autoSpec.Template))
+                    # 'none': ConvertFrom-Json on the wrapper side cannot hold an empty
+                    # PSCustomObject property name (without -AsHashtable, which 5.1 lacks),
+                    # so tokens that carry no P3 variant use this sentinel key instead of ''.
+                    $bgEntry['none'] = $autoSpec.Bg
+                }
+            }
+            break
+        }
+    }
+    $segList = New-Object 'System.Collections.Generic.List[object]'
+    [void]$segList.Add([ordered]@{ type = 'text'; style = 'plain'; template = $marker })
+    foreach ($member in $members) { [void]$segList.Add($member) }
+    [void]$autoBlocks.Add([ordered]@{ type = 'prompt'; alignment = 'left'; segments = $segList.ToArray() })
+    if ($bgEntry.Count -gt 0) { $autoBgs[[string]$autoIndex] = $bgEntry }
+}
+# Terminator block: marker N alone, closing the last token's segment cleanly.
+[void]$autoBlocks.Add([ordered]@{ type = 'prompt'; alignment = 'left'; segments = @([ordered]@{ type = 'text'; style = 'plain'; template = ($autoOpen + $autoTokens.Count.ToString($Invariant) + $autoClose) }) })
+
+# 1f: VL_MAX_LINES was already normalised above, character for character with
+# statusline.ps1's own statement (Get-BoundedInt, 1..64, MaxLen 2); VL_NOCOLOR;
+# and any background a token actually needs being the empty string (Get-Fg ''
+# would keep whatever foreground came before it; OMP cannot).
+$autoMaxLines = [int]$Cfg.VL_MAX_LINES
+$autoBgEmpty = $false
+foreach ($entry in $autoBgs.Values) { foreach ($value in $entry.Values) { if ([string]::IsNullOrEmpty([string]$value)) { $autoBgEmpty = $true } } }
+$produceAuto = ($Cfg.VL_LAYOUT -eq 'auto') -and ($Cfg.VL_NOCOLOR -ne '1') -and ($autoMaxLines -gt 1) -and (-not $autoBgEmpty)
+if ($Cfg.VL_LAYOUT -eq 'auto' -and -not $produceAuto) {
+    [Console]::Error.WriteLine('warning: VL_LAYOUT=auto cannot be rendered by the Oh-My-Posh engine with this config (VL_NOCOLOR, VL_MAX_LINES<=1, or an empty required background); rendering VL_SEGMENTS as one fixed row')
+}
+$autoConfig = [ordered]@{
+    '$schema' = 'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/schema.json'
+    version = 4
+    var = [ordered]@{
+        CorallineGenerator = 'coralline-omp/1'
+        CorallineAutoCount = [int]$autoTokens.Count
+        CorallineAutoTokens = $autoTokens
+        CorallineAutoStyle = [string]$Cfg.VL_STYLE
+        CorallineAutoBgs = $autoBgs
+    }
+    blocks = $autoBlocks.ToArray()
+}
+
 $config = [ordered]@{
     '$schema' = 'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/schema.json'
     version = 4
@@ -1044,4 +1205,8 @@ else { [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($OutFile), $
 if (-not [string]::IsNullOrEmpty($FloatOutFile)) {
     $floatText = (ConvertTo-CanonicalJson (New-FloatConfig) 0) + "`n"
     [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($FloatOutFile), $floatText, $Utf8NoBom)
+}
+if ($produceAuto -and -not [string]::IsNullOrEmpty($AutoOutFile)) {
+    $autoText = (ConvertTo-CanonicalJson $autoConfig 0) + "`n"
+    [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($AutoOutFile), $autoText, $Utf8NoBom)
 }
