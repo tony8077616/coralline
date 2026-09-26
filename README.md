@@ -184,6 +184,28 @@ Set `VL_LIMIT_SYNC=1` to let sessions that redraw share the account's open 5h an
 
 Set `VL_FLOAT=1` to write a plain-text line to `~/.claude/coralline/float.txt` on each render. The default `VL_FLOAT_SEGMENTS` is `model ctx cost`. coralline ships no display carrier; the file is the integration seam, with an unsupported [iTerm2 example](./example/float-display-iterm2/) included. The design boundary is documented in [issue #15](https://github.com/Nanako0129/coralline/issues/15).
 
+### Oh-My-Posh engine (experimental, PowerShell only)
+
+`install.ps1 -Engine omp` renders the main statusline through [Oh-My-Posh](https://ohmyposh.dev/) instead of the native renderer. It needs Oh-My-Posh 31.3.0 or newer. The installer checks `oh-my-posh version` before it writes anything, and stops if Oh-My-Posh is missing or older.
+
+```powershell
+& "$PSHOME\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\install.ps1 -SourceDirectory (Get-Location).Path -InstallRoot "$HOME\.claude\coralline" -SettingsPath "$HOME\.claude\settings.json" -Engine omp
+```
+
+That is local mode from an audited checkout. Remote mode takes the same `-Engine omp`, and downloads `statusline-omp.ps1` and `tools\build-omp-config.ps1` from the same commit as everything else, so `-Repo`/`-Ref` must name a commit that contains them. On top of the native payload, the installer adds those two files and generates `coralline.omp.json`, `coralline.float.omp.json` and `coralline.auto.omp.json` from `coralline.conf` into the install root. It then points `statusLine` at `statusline-omp.ps1 -Config "<install root>\coralline.omp.json"`, with `refreshInterval: 2` until the Oh-My-Posh engine is benchmarked. The explicit `-Config` takes precedence over `CORALLINE_OMP_CONFIG`. The generated files are managed like the renderer: backed up when they change, rolled back on failure, and left alone by an identical rerun.
+
+- **Oh-My-Posh on PATH (the default).** The command names no executable; `statusline-omp.ps1` finds `oh-my-posh` on PATH at render time, the way the native renderer finds `git`. Use this mode with the Microsoft Store/winget (MSIX) build, whose `oh-my-posh.exe` is an App Execution Alias.
+- **`-OmpPath <absolute path to oh-my-posh.exe>`** pins one executable with `-OmpExe`. It must be an existing, non-reparse-point file named `oh-my-posh.exe`, so it cannot be an App Execution Alias. The flag is refused without `-Engine omp`.
+- **Regenerate after editing `coralline.conf`.** Rerun the installer with `-Engine omp`, or run `tools\build-omp-config.ps1` yourself with `-ConfigPath`, `-OutFile`, `-FloatOutFile`, `-AutoOutFile` and `-AutoPlaceholder`. `VL_SEGMENTS`, `VL_FLOAT_SEGMENTS`, the style, the colors and the theme are built into the generated configs and stay stale until then; `VL_FLOAT_SEP` and the other render-time settings apply immediately. `VL_FLOAT=1` renders from `coralline.float.omp.json`, which is always generated. When `VL_LAYOUT=auto` cannot be generated (`VL_NOCOLOR=1`, `VL_MAX_LINES` of 1, an empty background, or a non-auto layout), `coralline.auto.omp.json` is a placeholder and the statusline renders as one fixed row.
+- **Configuration is read at install time.** The installer reads `coralline.conf` next to the install root and ignores `CORALLINE_CONFIG`, while the statusline honours it at render time. It prints a note when `CORALLINE_CONFIG`, `CORALLINE_OMP_EXE` or `CORALLINE_OMP_CONFIG` is set. It never creates or edits `coralline.conf`.
+- **Subagent rows stay on the native renderer.** `-SubagentRows on` writes the native `statusline.ps1 --subagent` command, and `statusline-omp.ps1 --subagent` hands off to it anyway. Under `preserve`, a `statusline-omp.ps1 ... --subagent` row for the same install moves to the native row only when `-Engine omp` runs; native and Bash reruns leave it in place, where it keeps working.
+- **PowerShell only.** `install.sh` and the Bash runtime have no Oh-My-Posh engine, and `-Engine omp -Runtime bash` is refused. `-Engine omp` also refuses an elevated (Administrator) shell.
+- **Switching back.** Rerun `install.ps1` without `-Engine`: `statusLine` returns to the native or Bash command, and the Oh-My-Posh files stay in place, the same way `statusline.sh` does.
+- **Oh-My-Posh self-updates.** The generated configs have no `upgrade` key, so they rely on Oh-My-Posh's own default of not checking for or installing updates during renders.
+- **Troubleshooting.** When the generator fails on a first install, the installer stops with a "manual recovery" error and leaves the new files and its backup directories in place. Your `settings.json` is not touched in that case. Fix the reported problem and run the installer again.
+
+Performance figures for the Oh-My-Posh engine are not published yet.
+
 ## Update, reconfigure, and uninstall
 
 ### Updating

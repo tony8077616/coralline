@@ -5,6 +5,11 @@
   Remote mode resolves one GitHub ref to a commit, then downloads only the
   renderer and the shipped themes from that commit. Local mode is hermetic and
   requires every destination explicitly.
+
+  -Engine omp (experimental) also installs the Oh-My-Posh wrapper and its config
+  generator, generates the three Oh-My-Posh configs from coralline.conf, and
+  points statusLine at statusline-omp.ps1. The default -Engine native takes none
+  of those code paths.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Remote')]
@@ -33,7 +38,12 @@ param(
     [string]$SubagentRows = 'preserve',
 
     [ValidateSet('auto', 'native', 'bash', IgnoreCase = $false)]
-    [string]$Runtime = 'auto'
+    [string]$Runtime = 'auto',
+
+    [ValidateSet('native', 'omp', IgnoreCase = $false)]
+    [string]$Engine = 'native',
+
+    [string]$OmpPath = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -47,10 +57,15 @@ $script:MaxSettingsBytes = 8MB
 $script:MaxApiBytes = 1MB
 $script:MaxRuntimeBytes = 2MB
 $script:MaxThemeBytes = 256KB
+$script:MaxGeneratedBytes = 1MB
+$script:MaxProcessOutputBytes = 64KB
+$script:MaxOmpVersionBytes = 4KB
+$script:MinimumOmpVersion = [version]'31.3.0'
 $script:MaxJsonDepth = 128
 $script:ApiOrigin = 'https://api.github.com'
 $script:RawOrigin = 'https://raw.githubusercontent.com'
 $script:LocalMode = $PSCmdlet.ParameterSetName -ceq 'Local'
+$script:OmpPathBound = $PSBoundParameters.ContainsKey('OmpPath')
 $script:ManagedFiles = @(
     'statusline.ps1',
     'themes\catppuccin-mocha.conf',
@@ -278,6 +293,15 @@ function Assert-GitBashHasJq([string]$Bash) {
 
 function Get-ManagedFileLimit([string]$Relative) {
     if ($Relative -ceq 'statusline.ps1' -or $Relative -ceq 'statusline.sh') { return $script:MaxRuntimeBytes }
+    if ($Engine -ceq 'omp') {
+        if ($Relative -ceq 'statusline-omp.ps1' -or $Relative -ceq 'tools\build-omp-config.ps1') {
+            return $script:MaxRuntimeBytes
+        }
+        if ($Relative -ceq 'coralline.omp.json' -or $Relative -ceq 'coralline.float.omp.json' -or
+            $Relative -ceq 'coralline.auto.omp.json') {
+            return $script:MaxGeneratedBytes
+        }
+    }
     return $script:MaxThemeBytes
 }
 
@@ -571,6 +595,12 @@ function Assert-ExpectedManagedInventory([string]$Root, [string]$Label) {
         if ($files[$i] -cne $expectedFiles[$i]) { throw "$Label has an unexpected file: $($files[$i])" }
     }
     $directories = @($inventory.Directories | Sort-Object)
+    if ($Engine -ceq 'omp') {
+        if ($directories.Count -ne 2 -or $directories[0] -cne 'themes' -or $directories[1] -cne 'tools') {
+            throw "$Label has an unexpected directory inventory"
+        }
+        return
+    }
     if ($directories.Count -ne 1 -or $directories[0] -cne 'themes') {
         throw "$Label has an unexpected directory inventory"
     }
@@ -608,6 +638,32 @@ function Assert-ValidManagedPayload([string]$Root, [string]$Label) {
             if ($shellText.IndexOf([char]0) -ge 0) { throw "$Label statusline.sh contains a NUL byte" }
             if ($shellText.IndexOf([char]13) -ge 0) {
                 throw "$Label statusline.sh contains a carriage return; use a checkout with LF line endings"
+            }
+            continue
+        }
+        if ($Engine -ceq 'omp' -and
+            ($relative -ceq 'statusline-omp.ps1' -or $relative -ceq 'tools\build-omp-config.ps1')) {
+            if ($length -eq 0 -or $length -gt $script:MaxRuntimeBytes) {
+                throw "$Label $relative has an invalid size"
+            }
+            $ompTokens = $null
+            $ompParseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+                $path,
+                [ref]$ompTokens,
+                [ref]$ompParseErrors
+            )
+            if ($ompParseErrors.Count -gt 0) {
+                throw "$Label $relative failed PowerShell parsing: $($ompParseErrors[0].Message)"
+            }
+            try { $ompText = $script:StrictUtf8.GetString([System.IO.File]::ReadAllBytes($path)) }
+            catch { throw "$Label $relative is not strict UTF-8" }
+            if ($ompText.IndexOf([char]0) -ge 0) { throw "$Label $relative contains a NUL byte" }
+            if ($ompText.IndexOf([char]13) -ge 0) {
+                throw "$Label $relative contains a carriage return; use a checkout with LF line endings"
+            }
+            if ($relative -ceq 'statusline-omp.ps1' -and -not $ompText.Contains('CorallineGenerator')) {
+                throw "$Label statusline-omp.ps1 failed content validation"
             }
             continue
         }
@@ -1299,6 +1355,12 @@ function Remove-EmptyCreatedRuntime([string]$Destination, [bool]$DestinationExis
     if ([System.IO.Directory]::Exists($themes) -and (Test-DirectoryEmpty $themes)) {
         [System.IO.Directory]::Delete($themes)
     }
+    if ($Engine -ceq 'omp') {
+        $tools = [System.IO.Path]::Combine($Destination, 'tools')
+        if ([System.IO.Directory]::Exists($tools) -and (Test-DirectoryEmpty $tools)) {
+            [System.IO.Directory]::Delete($tools)
+        }
+    }
     if ([System.IO.Directory]::Exists($Destination) -and (Test-DirectoryEmpty $Destination)) {
         [System.IO.Directory]::Delete($Destination)
     }
@@ -1468,7 +1530,654 @@ function Undo-RuntimeInstall(
     ) $Transaction.Expected
 }
 
+# ---- -Engine omp only: nothing below runs for the default -Engine native ----
+
+$script:OmpGeneratedFiles = @(
+    'coralline.omp.json',
+    'coralline.float.omp.json',
+    'coralline.auto.omp.json'
+)
+$script:OmpVersionTimeoutMs = 10000
+$script:OmpGeneratorTimeoutMs = 60000
+
+function Invoke-WithManagedSet([string[]]$Files, [scriptblock]$Body) {
+    # Every upstream helper walks $script:ManagedFiles; -Engine omp runs them on
+    # two lists (base payload, generated configs), one call at a time. The Body
+    # returns its result and never assigns caller variables.
+    $managedSetSaved = $script:ManagedFiles
+    try {
+        $script:ManagedFiles = $Files
+        return (& $Body)
+    } finally {
+        $script:ManagedFiles = $managedSetSaved
+    }
+}
+
+function Test-InstallerElevated {
+    # Under UAC the Administrators group is enabled only in an elevated token,
+    # so IsInRole(Administrator) is true exactly when this token is elevated.
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } finally {
+        $identity.Dispose()
+    }
+}
+
+function Invoke-BoundedProcess(
+    [string]$FileName,
+    [string]$Arguments,
+    [string]$WorkingDirectory,
+    [int]$TimeoutMs,
+    [long]$StdoutLimit,
+    [long]$StderrLimit,
+    [bool]$RemoveCorallineEnvironment
+) {
+    # stdin closed at once; stdout and stderr read concurrently, each kept up to
+    # its limit (a negative limit drains and discards). Over a limit or past the
+    # deadline the process is killed and always waited for.
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $FileName
+    $start.Arguments = $Arguments
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.CreateNoWindow = $true
+    if (-not [string]::IsNullOrEmpty($WorkingDirectory)) { $start.WorkingDirectory = $WorkingDirectory }
+    if ($RemoveCorallineEnvironment) {
+        foreach ($name in @($start.EnvironmentVariables.Keys)) {
+            $variable = [string]$name
+            if ($variable.StartsWith('CORALLINE_', [System.StringComparison]::OrdinalIgnoreCase) -or
+                $variable.StartsWith('REMORA_', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $start.EnvironmentVariables.Remove($variable)
+            }
+        }
+    }
+    $process = [System.Diagnostics.Process]::Start($start)
+    try {
+        $process.StandardInput.Close()
+        $streams = @($process.StandardOutput.BaseStream, $process.StandardError.BaseStream)
+        $limits = @($StdoutLimit, $StderrLimit)
+        $kept = @((New-Object System.IO.MemoryStream), (New-Object System.IO.MemoryStream))
+        $chunks = @((New-Object byte[] 8192), (New-Object byte[] 8192))
+        $totals = @([long]0, [long]0)
+        $open = @($true, $true)
+        $reads = @($streams[0].ReadAsync($chunks[0], 0, 8192), $streams[1].ReadAsync($chunks[1], 0, 8192))
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        $timedOut = $false
+        $overflow = $false
+        while ($open[0] -or $open[1]) {
+            $remaining = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($remaining -le 0) {
+                $timedOut = $true
+                break
+            }
+            $pending = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
+            for ($i = 0; $i -lt 2; $i++) { if ($open[$i]) { $pending.Add($reads[$i]) } }
+            [void][System.Threading.Tasks.Task]::WaitAny($pending.ToArray(), [int][Math]::Min($remaining, 250))
+            for ($i = 0; $i -lt 2; $i++) {
+                if (-not $open[$i] -or -not $reads[$i].IsCompleted) { continue }
+                $read = 0
+                try { $read = [int]$reads[$i].Result } catch { $read = 0 }
+                if ($read -le 0) {
+                    $open[$i] = $false
+                    continue
+                }
+                $totals[$i] += $read
+                if ($limits[$i] -ge 0) {
+                    if ($totals[$i] -gt $limits[$i]) {
+                        $overflow = $true
+                        break
+                    }
+                    $kept[$i].Write($chunks[$i], 0, $read)
+                }
+                $reads[$i] = $streams[$i].ReadAsync($chunks[$i], 0, 8192)
+            }
+            if ($overflow) { break }
+        }
+        if (-not $timedOut -and -not $overflow) {
+            $remaining = [int][Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if (-not $process.WaitForExit($remaining)) { $timedOut = $true }
+        }
+        if ($timedOut -or $overflow) {
+            try { $process.Kill() } catch { }
+        }
+        $process.WaitForExit()
+        $exitCode = -1
+        if (-not $timedOut -and -not $overflow) { $exitCode = $process.ExitCode }
+        return ,([pscustomobject]@{
+            ExitCode = $exitCode
+            TimedOut = $timedOut
+            Overflow = $overflow
+            Stdout = $kept[0].ToArray()
+            Stderr = $kept[1].ToArray()
+        })
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Get-OmpVersion([string]$Executable) {
+    try {
+        $run = Invoke-BoundedProcess (
+            $Executable
+        ) 'version' $null $script:OmpVersionTimeoutMs $script:MaxOmpVersionBytes -1 $false
+    } catch {
+        throw "Oh-My-Posh could not be started ($Executable): $($_.Exception.Message)"
+    }
+    if ($run.TimedOut) {
+        throw "Oh-My-Posh did not answer 'version' within $($script:OmpVersionTimeoutMs / 1000) seconds: $Executable"
+    }
+    if ($run.Overflow) {
+        throw "Oh-My-Posh 'version' printed more than $($script:MaxOmpVersionBytes) bytes: $Executable"
+    }
+    if ($run.ExitCode -ne 0) { throw "Oh-My-Posh 'version' exited with $($run.ExitCode): $Executable" }
+    $text = [System.Text.Encoding]::ASCII.GetString([byte[]]$run.Stdout)
+    $match = [regex]::Match($text, '\A([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})')
+    if (-not $match.Success) { throw "Oh-My-Posh 'version' printed no version number: $Executable" }
+    $version = New-Object System.Version(
+        [int]$match.Groups[1].Value,
+        [int]$match.Groups[2].Value,
+        [int]$match.Groups[3].Value
+    )
+    if ($version -lt $script:MinimumOmpVersion) {
+        throw "Oh-My-Posh $version is older than the $($script:MinimumOmpVersion) that -Engine omp needs: $Executable"
+    }
+    return $version
+}
+
+function Resolve-OmpExecutable {
+    # -OmpPath pins one absolute, non-reparse oh-my-posh.exe into the command.
+    # Otherwise the command names no executable and statusline-omp.ps1 resolves
+    # oh-my-posh from PATH at render time, as the native runtime resolves git.
+    if ($script:OmpPathBound) {
+        $pinned = Resolve-CanonicalLocalPath $OmpPath 'OmpPath'
+        if (-not [System.IO.Path]::GetFileName($pinned).Equals(
+            'oh-my-posh.exe',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "OmpPath must name oh-my-posh.exe: $pinned"
+        }
+        Assert-SafeExistingFile $pinned 'OmpPath'
+        if (-not [System.IO.File]::Exists($pinned)) { throw "OmpPath does not exist: $pinned" }
+        Assert-CommandPath $pinned 'OmpPath'
+        [void](Get-OmpVersion $pinned)
+        return ,([pscustomobject]@{ Pinned = $pinned; Checked = $pinned })
+    }
+    $found = @(Get-Command -Name 'oh-my-posh' -CommandType Application -ErrorAction SilentlyContinue)
+    if ($found.Count -eq 0) {
+        throw "Oh-My-Posh $($script:MinimumOmpVersion) or newer was not found on PATH; install it, or pass -OmpPath with the absolute path of oh-my-posh.exe"
+    }
+    $source = [string]$found[0].Source
+    if (-not [System.IO.Path]::IsPathRooted($source) -or
+        -not [System.IO.Path]::GetExtension($source).Equals('.exe', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "the oh-my-posh found first on PATH is not an .exe ($source); -Engine omp needs oh-my-posh.exe"
+    }
+    [void](Get-OmpVersion $source)
+    return ,([pscustomobject]@{ Pinned = $null; Checked = $source })
+}
+
+function Get-BoundedDiagnostic([byte[]]$Bytes) {
+    $text = [System.Text.Encoding]::ASCII.GetString($Bytes)
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($character in $text.ToCharArray()) {
+        if ($builder.Length -ge 400) { break }
+        if (Test-HasControlCharacter ([string]$character)) { [void]$builder.Append(' ') }
+        else { [void]$builder.Append($character) }
+    }
+    return $builder.ToString().Trim()
+}
+
+function Invoke-OmpConfigGenerator(
+    [string]$PowerShell,
+    [string]$InstallRoot,
+    [string]$ConfigPath,
+    [string]$OutputRoot,
+    [string]$WorkingDirectory
+) {
+    # Runs the generator that is already installed, so a conf that includes
+    # <install>\themes\*.conf reads the themes this same run just installed.
+    $generator = [System.IO.Path]::Combine($InstallRoot, 'tools\build-omp-config.ps1')
+    $arguments = (
+        '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $generator + '"' +
+        ' -ConfigPath "' + $ConfigPath + '"' +
+        ' -StatuslinePath "' + [System.IO.Path]::Combine($InstallRoot, 'statusline.ps1') + '"' +
+        ' -OutFile "' + [System.IO.Path]::Combine($OutputRoot, 'coralline.omp.json') + '"' +
+        ' -FloatOutFile "' + [System.IO.Path]::Combine($OutputRoot, 'coralline.float.omp.json') + '"' +
+        ' -AutoOutFile "' + [System.IO.Path]::Combine($OutputRoot, 'coralline.auto.omp.json') + '"' +
+        ' -AutoPlaceholder'
+    )
+    try {
+        $run = Invoke-BoundedProcess (
+            $PowerShell
+        ) $arguments $WorkingDirectory $script:OmpGeneratorTimeoutMs (
+            $script:MaxProcessOutputBytes
+        ) $script:MaxProcessOutputBytes $true
+    } catch {
+        throw "Oh-My-Posh config generator could not be started: $($_.Exception.Message)"
+    }
+    if ($run.TimedOut) {
+        throw "Oh-My-Posh config generator did not finish within $($script:OmpGeneratorTimeoutMs / 1000) seconds"
+    }
+    if ($run.Overflow) {
+        throw "Oh-My-Posh config generator printed more than $($script:MaxProcessOutputBytes) bytes"
+    }
+    if ($run.ExitCode -ne 0) {
+        throw "Oh-My-Posh config generator exited with $($run.ExitCode): $(Get-BoundedDiagnostic ([byte[]]$run.Stderr))"
+    }
+    $warnings = New-Object 'System.Collections.Generic.List[string]'
+    $stderrText = [System.Text.Encoding]::ASCII.GetString([byte[]]$run.Stderr)
+    foreach ($line in $stderrText.Split([char]10)) {
+        $trimmed = $line.TrimEnd([char]13)
+        if ($trimmed.StartsWith('warning: ', [System.StringComparison]::Ordinal) -and
+            -not (Test-HasControlCharacter $trimmed)) {
+            $warnings.Add($trimmed)
+        }
+    }
+    return ,([string[]]$warnings.ToArray())
+}
+
+function Assert-GeneratedPayload([string]$Root, [string[]]$Expected) {
+    $label = 'generated Oh-My-Posh configs'
+    $inventory = Get-SafeTreeInventory $Root $label
+    if (@($inventory.Directories).Count -ne 0) { throw "$label have an unexpected directory inventory" }
+    $files = @($inventory.Files | Sort-Object)
+    $expectedFiles = @($Expected | Sort-Object)
+    if ($files.Count -ne $expectedFiles.Count) { throw "$label have an unexpected file inventory" }
+    for ($i = 0; $i -lt $expectedFiles.Count; $i++) {
+        if ($files[$i] -cne $expectedFiles[$i]) { throw "$label have an unexpected file: $($files[$i])" }
+    }
+    $ascii = [System.Text.Encoding]::GetEncoding(
+        'us-ascii',
+        [System.Text.EncoderFallback]::ExceptionFallback,
+        [System.Text.DecoderFallback]::ExceptionFallback
+    )
+    foreach ($relative in $expectedFiles) {
+        $path = [System.IO.Path]::Combine($Root, $relative)
+        $bytes = Read-BoundedSharedFileBytes $path $script:MaxGeneratedBytes "generated $relative"
+        if ($bytes.Length -eq 0) { throw "generated $relative is empty" }
+        try { $text = $ascii.GetString($bytes) }
+        catch { throw "generated $relative is not ASCII" }
+        if ($text.IndexOf([char]0) -ge 0) { throw "generated $relative contains a NUL byte" }
+        if ($text.IndexOf([char]13) -ge 0) { throw "generated $relative contains a carriage return" }
+        if ($text -cnotmatch '"CorallineGenerator"\s*:\s*"coralline-omp/') {
+            throw "generated $relative lacks the coralline-omp generator marker"
+        }
+        if ($text -cmatch '"upgrade"\s*:') { throw "generated $relative contains an upgrade key" }
+    }
+}
+
+function Undo-OmpInstall(
+    [string]$Destination,
+    [string[]]$BaseSet,
+    [string]$BaseBackup,
+    $BaseTransaction,
+    [string[]]$GeneratedSet,
+    [string]$GeneratedBackup,
+    $GeneratedTransaction
+) {
+    # Reverse order. A fail-closed undo stops here: later undos would act on a
+    # tree that already needs manual recovery.
+    if ($null -ne $GeneratedTransaction) {
+        try {
+            Invoke-WithManagedSet $GeneratedSet {
+                Undo-RuntimeInstall $Destination $GeneratedBackup $GeneratedTransaction
+            }
+        } catch {
+            throw "generated config rollback failed ($($_.Exception.Message)); the managed runtime was not rolled back; files and backups retained at $BaseBackup and $GeneratedBackup"
+        }
+    }
+    if ($null -ne $BaseTransaction) {
+        try {
+            Invoke-WithManagedSet $BaseSet {
+                Undo-RuntimeInstall $Destination $BaseBackup $BaseTransaction
+            }
+        } catch {
+            throw "runtime rollback also failed ($($_.Exception.Message)); files and backups retained at $BaseBackup and $GeneratedBackup"
+        }
+    }
+}
+
+function Invoke-CorallineOmpInstall {
+    # Phase 0: every check runs before anything is created or written.
+    if ($Runtime -ceq 'bash') {
+        throw '-Engine omp needs the native runtime (statusline-omp.ps1 is PowerShell only); use -Runtime native or auto'
+    }
+    if (Test-InstallerElevated) {
+        throw '-Engine omp refuses an elevated (Administrator) token; rerun the installer from a non-elevated PowerShell'
+    }
+    $localMode = $script:LocalMode
+    if ($localMode) {
+        $sourceRoot = Resolve-CanonicalLocalPath $SourceDirectory 'SourceDirectory'
+        $install = Resolve-CanonicalLocalPath $InstallRoot 'InstallRoot'
+        $settings = Resolve-CanonicalLocalPath $SettingsPath 'SettingsPath'
+    } else {
+        Assert-ValidRepoAndRef $Repo $Ref
+        $homePath = [string]$HOME
+        if ([string]::IsNullOrWhiteSpace($homePath)) {
+            $homePath = [System.Environment]::GetFolderPath('UserProfile')
+        }
+        $homePath = Resolve-CanonicalLocalPath $homePath 'HOME'
+        $claudeRoot = [System.IO.Path]::Combine($homePath, '.claude')
+        $sourceRoot = $null
+        $install = Resolve-CanonicalLocalPath ([System.IO.Path]::Combine($claudeRoot, 'coralline')) 'install root'
+        $settings = Resolve-CanonicalLocalPath ([System.IO.Path]::Combine($claudeRoot, 'settings.json')) 'settings path'
+    }
+
+    $installParent = Resolve-CanonicalLocalPath ([System.IO.Path]::GetDirectoryName($install)) 'install parent'
+    $settingsParent = Resolve-CanonicalLocalPath ([System.IO.Path]::GetDirectoryName($settings)) 'settings parent'
+    $config = Resolve-CanonicalLocalPath ([System.IO.Path]::Combine($installParent, 'coralline.conf')) 'config path'
+    $powershell = Resolve-CanonicalLocalPath ([System.IO.Path]::Combine($PSHOME, 'powershell.exe')) 'PowerShell executable'
+    if (-not [System.IO.File]::Exists($powershell)) { throw "trusted PowerShell executable is missing: $powershell" }
+    Assert-CommandPath $powershell 'PowerShell executable'
+    [Console]::Out.WriteLine('runtime: native (engine omp)')
+    $omp = Resolve-OmpExecutable
+    if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_CONFIG)) {
+        [Console]::Out.WriteLine(
+            "note: CORALLINE_CONFIG is set; the installer ignores it and generated the Oh-My-Posh configs from $config, " +
+            'but the statusline reads the file CORALLINE_CONFIG names at render time; keep the two in step'
+        )
+    }
+    if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_OMP_EXE)) {
+        if ($null -ne $omp.Pinned) {
+            [Console]::Out.WriteLine(
+                'note: CORALLINE_OMP_EXE is set, but the statusLine command pins -OmpExe ' + $omp.Pinned +
+                ', which takes precedence at render time'
+            )
+        } else {
+            [Console]::Out.WriteLine(
+                'note: CORALLINE_OMP_EXE is set; the installer checked ' + $omp.Checked +
+                ' from PATH, but statusline-omp.ps1 runs the executable CORALLINE_OMP_EXE names at render time'
+            )
+        }
+    }
+    if (-not [string]::IsNullOrEmpty([string]$env:CORALLINE_OMP_CONFIG)) {
+        [Console]::Out.WriteLine(
+            'note: CORALLINE_OMP_CONFIG is set but has no effect: the statusLine command passes -Config explicitly'
+        )
+    }
+    Assert-SafeExistingDirectory $install 'install root'
+    Assert-SafeExistingFile $settings 'settings path'
+    Assert-SafeExistingFile $config 'config path'
+    if ($null -ne $sourceRoot) {
+        Assert-SafeExistingDirectory $sourceRoot 'source directory'
+        if (-not [System.IO.Directory]::Exists($sourceRoot)) { throw "SourceDirectory does not exist: $sourceRoot" }
+    }
+
+    $identifier = [guid]::NewGuid().ToString('N')
+    $timestamp = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmssfff', $script:Invariant)
+    $installLeaf = [System.IO.Path]::GetFileName($install)
+    $settingsLeaf = [System.IO.Path]::GetFileName($settings)
+    $stage = Resolve-CanonicalLocalPath (
+        [System.IO.Path]::Combine($installParent, ".$installLeaf.install.$identifier")
+    ) 'staging path'
+    $generate = Resolve-CanonicalLocalPath (
+        [System.IO.Path]::Combine($installParent, ".$installLeaf.generate.$identifier")
+    ) 'generator output path'
+    $runtimeBackup = Resolve-CanonicalLocalPath (
+        [System.IO.Path]::Combine($installParent, "$installLeaf.bak.$timestamp.$identifier")
+    ) 'runtime backup path'
+    $generatedBackup = Resolve-CanonicalLocalPath "$runtimeBackup.generated" 'generated config backup path'
+    $settingsBackup = Resolve-CanonicalLocalPath "$settings.bak.$timestamp.$identifier" 'settings backup path'
+    $settingsTemporary = Resolve-CanonicalLocalPath (
+        [System.IO.Path]::Combine($settingsParent, ".$settingsLeaf.tmp.$identifier")
+    ) 'settings temporary path'
+    $settingsRestoreTemporary = Resolve-CanonicalLocalPath (
+        [System.IO.Path]::Combine($settingsParent, ".$settingsLeaf.restore.$identifier")
+    ) 'settings rollback temporary path'
+
+    $pathEntries = New-Object 'System.Collections.Generic.List[object]'
+    if ($null -ne $sourceRoot) {
+        $pathEntries.Add([pscustomobject]@{ Label = 'source directory'; Path = $sourceRoot })
+    }
+    foreach ($entry in @(
+        [pscustomobject]@{ Label = 'install root'; Path = $install },
+        [pscustomobject]@{ Label = 'settings path'; Path = $settings },
+        [pscustomobject]@{ Label = 'config path'; Path = $config },
+        [pscustomobject]@{ Label = 'staging path'; Path = $stage },
+        [pscustomobject]@{ Label = 'generator output path'; Path = $generate },
+        [pscustomobject]@{ Label = 'runtime backup path'; Path = $runtimeBackup },
+        [pscustomobject]@{ Label = 'generated config backup path'; Path = $generatedBackup },
+        [pscustomobject]@{ Label = 'settings backup path'; Path = $settingsBackup },
+        [pscustomobject]@{ Label = 'settings temporary path'; Path = $settingsTemporary },
+        [pscustomobject]@{ Label = 'settings rollback temporary path'; Path = $settingsRestoreTemporary }
+    )) {
+        $pathEntries.Add($entry)
+    }
+    Assert-DisjointPaths $pathEntries.ToArray()
+    foreach ($entry in $pathEntries) { Assert-NoReparsePath $entry.Path $entry.Label }
+
+    $runtimePath = Resolve-CanonicalLocalPath (
+        [System.IO.Path]::Combine($install, 'statusline.ps1')
+    ) 'installed runtime path'
+    Assert-CommandPath $runtimePath 'installed runtime path'
+    $wrapperPath = Resolve-CanonicalLocalPath (
+        [System.IO.Path]::Combine($install, 'statusline-omp.ps1')
+    ) 'installed Oh-My-Posh wrapper path'
+    Assert-CommandPath $wrapperPath 'installed Oh-My-Posh wrapper path'
+    $ompConfigPath = Resolve-CanonicalLocalPath (
+        [System.IO.Path]::Combine($install, 'coralline.omp.json')
+    ) 'installed Oh-My-Posh config path'
+    Assert-CommandPath $ompConfigPath 'installed Oh-My-Posh config path'
+    $nativeCommand = '"' + $powershell + '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $runtimePath + '"'
+    $wrapperCommand = '"' + $powershell + '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $wrapperPath + '"'
+    $command = $wrapperCommand + ' -Config "' + $ompConfigPath + '"'
+    if ($null -ne $omp.Pinned) { $command += ' -OmpExe "' + $omp.Pinned + '"' }
+    $refreshInterval = '2'
+    $shellScriptArgument = ' "' + $install.Replace('\', '/') + '/statusline.sh"'
+    $anyBashSubagent = '"[A-Za-z]:\\[^"]*\\bin\\bash\.exe"' +
+        [regex]::Escape($shellScriptArgument + ' --subagent') + '\z'
+    # Subagent rows stay on the native renderer (the wrapper hands --subagent to
+    # it anyway). A Bash row for this root, or a wrapper --subagent row for this
+    # root, moves to the native row under preserve; anything else is the user's.
+    $otherSubagentPattern = '^(?:' + $anyBashSubagent + '|' + [regex]::Escape($wrapperCommand) +
+        '(?: -Config "[^"]*")?(?: -OmpExe "[^"]*")? --subagent\z)'
+    $desiredStatusLine = '{"type":"command","command":' + (ConvertTo-JsonString $command) +
+        ',"refreshInterval":' + $refreshInterval + '}'
+    $desiredSubagentStatusLine = '{"type":"command","command":' +
+        (ConvertTo-JsonString ($nativeCommand + ' --subagent')) + '}'
+
+    $baseFiles = [string[]](@($script:ManagedFiles) + @('statusline-omp.ps1', 'tools\build-omp-config.ps1'))
+    $generatedFiles = [string[]]$script:OmpGeneratedFiles
+
+    $installMutex = New-Object System.Threading.Mutex(
+        $false,
+        'Global\coralline-installer'
+    )
+    $mutexHeld = $false
+    $stageExists = $false
+    $generateExists = $false
+    $baseChanged = $false
+    $generatedChanged = $false
+    $settingsChanged = $false
+    $baseTransaction = $null
+    $generatedTransaction = $null
+    $settingsBackupMade = $false
+    $resolvedCommit = $null
+    try {
+        try {
+            $mutexHeld = $installMutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            $mutexHeld = $true
+        }
+        if (-not $mutexHeld) {
+            throw 'another coralline installer is already targeting these paths'
+        }
+
+        Ensure-SafeDirectory $installParent 'install parent'
+        if ([System.IO.Directory]::Exists($stage) -or [System.IO.File]::Exists($stage)) {
+            throw "staging path already exists: $stage"
+        }
+        [void][System.IO.Directory]::CreateDirectory($stage)
+        Assert-NoReparsePath $stage 'staging path'
+        $stageExists = $true
+
+        if ($localMode) {
+            Invoke-WithManagedSet $baseFiles { Stage-LocalPayload $sourceRoot $stage }
+        } else {
+            $resolvedCommit = Invoke-WithManagedSet $baseFiles { Stage-RemotePayload $Repo $Ref $stage }
+        }
+        Invoke-WithManagedSet $baseFiles { Assert-ValidStagedPayload $stage }
+        $baseExpected = Invoke-WithManagedSet $baseFiles { Get-ManagedPayloadBytes $stage }
+        $baseChanged = -not (Invoke-WithManagedSet $baseFiles { Test-ManagedPayloadEqual $stage $install })
+        $settingsPlan = Get-SettingsPlan (
+            $settings
+        ) $desiredStatusLine $SubagentRows $desiredSubagentStatusLine $otherSubagentPattern
+        $settingsChanged = [bool]$settingsPlan.Changed
+
+        # Phase 1: base payload (renderer, themes, wrapper, generator).
+        if ($baseChanged) {
+            $baseTransaction = Invoke-WithManagedSet $baseFiles {
+                Install-Runtime $stage $install $runtimeBackup $baseExpected
+            }
+        }
+
+        # Phases 2-4: generate from the installed tree, validate, install.
+        try {
+            Invoke-WithManagedSet $baseFiles {
+                Assert-ManagedPayloadBytes $install $baseExpected 'installed payload before generation'
+            }
+            if ([System.IO.Directory]::Exists($generate) -or [System.IO.File]::Exists($generate)) {
+                throw "generator output path already exists: $generate"
+            }
+            [void][System.IO.Directory]::CreateDirectory($generate)
+            Assert-NoReparsePath $generate 'generator output path'
+            $generateExists = $true
+            $generatorWarnings = Invoke-OmpConfigGenerator $powershell $install $config $generate $stage
+            Invoke-WithManagedSet $baseFiles {
+                Assert-ManagedPayloadBytes $install $baseExpected 'installed payload after generation'
+            }
+            Assert-GeneratedPayload $generate $generatedFiles
+            $generatedExpected = Invoke-WithManagedSet $generatedFiles { Get-ManagedPayloadBytes $generate }
+            $generatedChanged = -not (Invoke-WithManagedSet $generatedFiles {
+                Test-ManagedPayloadEqual $generate $install
+            })
+            if ($generatedChanged) {
+                $generatedTransaction = Invoke-WithManagedSet $generatedFiles {
+                    Install-Runtime $generate $install $generatedBackup $generatedExpected
+                }
+            }
+        } catch {
+            $generationFailure = $_.Exception.Message
+            if ($generateExists) {
+                # Clean up here so a cleanup failure (e.g. a reparse point the
+                # generator planted) cannot replace the real error in finally.
+                $generateExists = $false
+                try {
+                    Remove-SafeInstallerDirectory $generate $generate 'generator output path'
+                } catch {
+                    $generationFailure += "; generator output retained at $generate ($($_.Exception.Message))"
+                }
+            }
+            if ($null -ne $baseTransaction) {
+                if ($generationFailure.Contains('runtime rollback also failed')) {
+                    throw "Oh-My-Posh config install failed and its own rollback failed closed; the managed runtime was not rolled back; files and backups retained at $runtimeBackup and ${generatedBackup}: $generationFailure"
+                }
+                try {
+                    Undo-OmpInstall (
+                        $install
+                    ) $baseFiles $runtimeBackup $baseTransaction $generatedFiles $generatedBackup $null
+                } catch {
+                    throw "Oh-My-Posh config generation failed ($generationFailure); $($_.Exception.Message)"
+                }
+                throw "Oh-My-Posh config generation failed; previous managed runtime restored; displaced runtime files retained at ${runtimeBackup}: $generationFailure"
+            }
+            throw $generationFailure
+        }
+        foreach ($warning in $generatorWarnings) { [Console]::Out.WriteLine($warning) }
+
+        # Phase 5: no-op only when neither transaction nor settings changed.
+        if (-not $baseChanged -and -not $generatedChanged -and -not $settingsChanged) {
+            Invoke-WithManagedSet $baseFiles {
+                Assert-ManagedPayloadBytes $install $baseExpected 'installed payload'
+            }
+            Invoke-WithManagedSet $generatedFiles {
+                Assert-ManagedPayloadBytes $install $generatedExpected 'installed generated configs'
+            }
+            Assert-SettingsBytes $settings $settingsPlan.UpdatedBytes 'settings before no-op'
+            Remove-SafeInstallerDirectory $generate $generate 'generator output path'
+            $generateExists = $false
+            Remove-SafeInstallerDirectory $stage $stage 'staging path'
+            $stageExists = $false
+            [Console]::Out.WriteLine('coralline is already up to date.')
+            return
+        }
+
+        # Phase 6: settings, with the plan computed before phase 1.
+        if ($settingsChanged) {
+            Ensure-SafeDirectory $settingsParent 'settings parent'
+            try {
+                $settingsBackupMade = Commit-Settings (
+                    $settings
+                ) $settingsPlan $settingsBackup $settingsTemporary $settingsRestoreTemporary
+            } catch {
+                $settingsFailure = $_.Exception.Message
+                if ($null -ne $baseTransaction -or $null -ne $generatedTransaction) {
+                    try {
+                        Undo-OmpInstall (
+                            $install
+                        ) $baseFiles $runtimeBackup $baseTransaction $generatedFiles $generatedBackup $generatedTransaction
+                    } catch {
+                        throw "settings update failed ($settingsFailure); $($_.Exception.Message)"
+                    }
+                    throw "settings update failed; previous managed runtime and generated configs restored; displaced files retained at $runtimeBackup and ${generatedBackup}: $settingsFailure"
+                }
+                throw $settingsFailure
+            }
+        }
+
+        # Phase 7: final byte checks, each list against its own expected bytes.
+        Invoke-WithManagedSet $baseFiles {
+            Assert-ManagedPayloadBytes $install $baseExpected 'installed payload before success'
+        }
+        Invoke-WithManagedSet $generatedFiles {
+            Assert-ManagedPayloadBytes $install $generatedExpected 'installed generated configs before success'
+        }
+        Assert-SettingsBytes $settings $settingsPlan.UpdatedBytes 'settings before success'
+        [Console]::Out.WriteLine("coralline installed at $install")
+        if ($null -ne $resolvedCommit) {
+            [Console]::Out.WriteLine("resolved $Repo@$Ref to $resolvedCommit")
+        }
+        if ($null -ne $baseTransaction -and [bool]$baseTransaction.BackupCreated) {
+            [Console]::Out.WriteLine("runtime backup retained at $runtimeBackup")
+        }
+        if ($null -ne $generatedTransaction -and [bool]$generatedTransaction.BackupCreated) {
+            [Console]::Out.WriteLine("generated config backup retained at $generatedBackup")
+        }
+        if ($settingsChanged -and $settingsBackupMade) {
+            [Console]::Out.WriteLine("settings backup retained at $settingsBackup")
+        }
+        if ([System.IO.File]::Exists($config)) {
+            [Console]::Out.WriteLine("config preserved at $config")
+        }
+    } finally {
+        try {
+            try {
+                if ($generateExists -and [System.IO.Directory]::Exists($generate)) {
+                    Remove-SafeInstallerDirectory $generate $generate 'generator output path'
+                }
+            } finally {
+                if ($stageExists -and [System.IO.Directory]::Exists($stage)) {
+                    Remove-SafeInstallerDirectory $stage $stage 'staging path'
+                }
+            }
+        } finally {
+            if ($mutexHeld) {
+                $installMutex.ReleaseMutex()
+            }
+            $installMutex.Dispose()
+        }
+    }
+}
+
 function Invoke-CorallineInstall {
+    if ($Engine -ceq 'omp') {
+        Invoke-CorallineOmpInstall
+        return
+    }
+    if ($script:OmpPathBound) { throw '-OmpPath needs -Engine omp' }
     $localMode = $script:LocalMode
     if ($localMode) {
         $sourceRoot = Resolve-CanonicalLocalPath $SourceDirectory 'SourceDirectory'

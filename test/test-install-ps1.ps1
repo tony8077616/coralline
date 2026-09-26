@@ -2066,6 +2066,1021 @@ try {
     } else {
         Blocked 'reparse component rejection' 'mklink /J was unavailable in this Windows environment'
     }
+
+    # ---- -Engine omp (experimental Oh-My-Posh engine) -------------------------------
+    # Local mode under $TempRoot only. A compiled oh-my-posh.exe test double answers
+    # the installer's version probe; renders that need Oh-My-Posh itself use the
+    # first oh-my-posh.exe on this host's PATH (31.3.0 or newer), else they are Blocked.
+    $ompSavedInputEncoding = $null
+    try {
+        # .NET Framework writes the console input encoding's preamble into every
+        # redirected stdin; a UTF-8 BOM there would reach the renderers' JSON parsers.
+        $ompSavedInputEncoding = [Console]::InputEncoding
+        if ($ompSavedInputEncoding.GetPreamble().Length -gt 0) { [Console]::InputEncoding = $Utf8NoBom }
+    } catch { }
+    $OmpBaseManaged = @($ExpectedManaged) + @('statusline-omp.ps1', 'tools\build-omp-config.ps1')
+    $OmpGenerated = @('coralline.omp.json', 'coralline.float.omp.json', 'coralline.auto.omp.json')
+    $OmpManaged = @($OmpBaseManaged) + @($OmpGenerated)
+    $ompStubSource = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+
+public static class OmpStub {
+    public static int Main(string[] args) {
+        string dir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
+        string modeFile = Path.Combine(dir, "stub-mode.txt");
+        string mode = File.Exists(modeFile) ? File.ReadAllText(modeFile).Trim() : "version:31.3.0";
+        File.AppendAllText(Path.Combine(dir, "calls.log"), string.Join(" ", args) + "\n");
+        Stream stdout = Console.OpenStandardOutput();
+        if (mode.StartsWith("version:")) { Write(stdout, mode.Substring(8) + "\n"); return 0; }
+        if (mode == "sleep") { Thread.Sleep(60000); Write(stdout, "31.3.0\n"); return 0; }
+        if (mode == "big") { Write(stdout, "31.3.0" + new string('x', 8192) + "\n"); return 0; }
+        if (mode == "empty") { return 0; }
+        if (mode == "exit1") { Write(stdout, "31.3.0\n"); return 1; }
+        if (mode == "stderr") {
+            Stream stderr = Console.OpenStandardError();
+            byte[] chunk = Encoding.ASCII.GetBytes(new string('e', 65536));
+            for (int i = 0; i < 64; i++) stderr.Write(chunk, 0, chunk.Length);
+            stderr.Flush();
+            Write(stdout, "31.3.0\n");
+            return 0;
+        }
+        if (mode.StartsWith("proxy:")) {
+            ProcessStartInfo start = new ProcessStartInfo(mode.Substring(6));
+            StringBuilder line = new StringBuilder();
+            foreach (string a in args) {
+                if (line.Length > 0) line.Append(' ');
+                line.Append('"').Append(a.Replace("\"", "\\\"")).Append('"');
+            }
+            start.Arguments = line.ToString();
+            start.UseShellExecute = false;
+            start.RedirectStandardOutput = true;
+            // stdin is inherited, never re-encoded.
+            Process child = Process.Start(start);
+            MemoryStream output = new MemoryStream();
+            child.StandardOutput.BaseStream.CopyTo(output);
+            child.WaitForExit();
+            stdout.Write(output.ToArray(), 0, (int)output.Length);
+            stdout.Flush();
+            return child.ExitCode;
+        }
+        return 3;
+    }
+    static void Write(Stream s, string text) {
+        byte[] b = Encoding.ASCII.GetBytes(text);
+        s.Write(b, 0, b.Length);
+        s.Flush();
+    }
+}
+'@
+    $ompStubExe = Join-Path $TempRoot 'omp-stub-build\oh-my-posh.exe'
+    $ompStubReady = $false
+    try {
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($ompStubExe))
+        Add-Type -TypeDefinition $ompStubSource -OutputAssembly $ompStubExe -OutputType ConsoleApplication
+        $ompStubReady = [IO.File]::Exists($ompStubExe)
+    } catch {
+        [Console]::Out.WriteLine('DIAG  omp stub build failed: ' + $_.Exception.Message)
+    }
+    $ompElevated = $false
+    $ompIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $ompElevated = (New-Object Security.Principal.WindowsPrincipal($ompIdentity)).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator
+        )
+    } finally {
+        $ompIdentity.Dispose()
+    }
+
+    if (-not $ompStubReady) {
+        Blocked 'Engine omp installer cases' 'the oh-my-posh.exe test double could not be compiled with Add-Type'
+    } elseif ($ompElevated) {
+        Blocked 'Engine omp installer cases' 'this test process runs with an elevated token, which -Engine omp refuses by design (G5)'
+    } else {
+        function New-OmpStubDirectory([string]$Name, [string]$Mode, [string]$FileName = 'oh-my-posh.exe') {
+            $directory = Join-Path $TempRoot ('omp-stub ' + $Name)
+            [void][IO.Directory]::CreateDirectory($directory)
+            [IO.File]::Copy($ompStubExe, (Join-Path $directory $FileName), $true)
+            [IO.File]::WriteAllText((Join-Path $directory 'stub-mode.txt'), $Mode, $Utf8NoBom)
+            return $directory
+        }
+        $ompSystemPath = "$env:SystemRoot\system32;$env:SystemRoot"
+        $ompOkDir = New-OmpStubDirectory 'ok' 'version:31.3.0'
+        $ompOkPath = $ompOkDir + ';' + $ompSystemPath
+
+        function Invoke-OmpInstaller(
+            [string]$Source,
+            [string]$Install,
+            [string]$Settings,
+            [string[]]$Arguments = @('-Engine', 'omp'),
+            [string]$PathValue = $ompOkPath,
+            [string]$InstallerPath = $Installer,
+            [hashtable]$ExtraEnvironment = @{}
+        ) {
+            $parts = @(
+                '-NoLogo',
+                '-NoProfile',
+                '-NonInteractive',
+                '-ExecutionPolicy Bypass',
+                '-File ' + (Quote-ProcessArgument $InstallerPath),
+                '-SourceDirectory ' + (Quote-ProcessArgument $Source),
+                '-InstallRoot ' + (Quote-ProcessArgument $Install),
+                '-SettingsPath ' + (Quote-ProcessArgument $Settings)
+            )
+            foreach ($argument in $Arguments) {
+                if ($argument.StartsWith('-', [StringComparison]::Ordinal)) { $parts += $argument }
+                else { $parts += (Quote-ProcessArgument $argument) }
+            }
+            $environment = @{
+                CORALLINE_REPO = 'must-not-be-read'
+                CORALLINE_REF = 'must-not-be-read'
+                CORALLINE_BASE_URL = 'https://127.0.0.1:1/must-not-be-read'
+                CORALLINE_CONFIG = $null
+                CORALLINE_OMP_EXE = $null
+                CORALLINE_OMP_CONFIG = $null
+                PATH = $PathValue
+            }
+            foreach ($key in $ExtraEnvironment.Keys) { $environment[$key] = $ExtraEnvironment[$key] }
+            return Invoke-CapturedProcess $PowerShellExe ($parts -join ' ') '' $environment $Repo 180000
+        }
+
+        function Get-TreeSnapshot([string]$Root, [bool]$IncludeTimestamps = $true) {
+            $snapshot = [ordered]@{}
+            if (-not [IO.Directory]::Exists($Root)) { return ,$snapshot }
+            foreach ($item in @(Get-ChildItem -LiteralPath $Root -Recurse -Force | Sort-Object FullName)) {
+                $relative = $item.FullName.Substring($Root.Length)
+                if ($item.PSIsContainer) {
+                    $snapshot["dir:$relative"] = 'dir'
+                } else {
+                    $value = Get-FileSha256 $item.FullName
+                    if ($IncludeTimestamps) { $value += ':' + $item.LastWriteTimeUtc.Ticks }
+                    $snapshot["file:$relative"] = $value
+                }
+            }
+            return ,$snapshot
+        }
+
+        function Get-OmpBackups([string]$Claude) {
+            $runtime = @()
+            $generated = @()
+            if ([IO.Directory]::Exists($Claude)) {
+                foreach ($entry in @([IO.Directory]::GetDirectories($Claude, 'coralline.bak.*') | Sort-Object)) {
+                    if ($entry.EndsWith('.generated', [StringComparison]::Ordinal)) { $generated += $entry }
+                    else { $runtime += $entry }
+                }
+            }
+            return [pscustomobject]@{ Runtime = $runtime; Generated = $generated }
+        }
+
+        function Get-OmpLeftovers([string]$Claude) {
+            if (-not [IO.Directory]::Exists($Claude)) { return 0 }
+            return @([IO.Directory]::GetFileSystemEntries($Claude, '.coralline.*')).Count
+        }
+
+        function Get-OmpCommand([string]$Install, [string]$Pinned = '') {
+            $exe = [IO.Path]::GetFullPath((Join-Path $PSHOME 'powershell.exe'))
+            $wrapper = [IO.Path]::GetFullPath((Join-Path $Install 'statusline-omp.ps1'))
+            $configPath = [IO.Path]::GetFullPath((Join-Path $Install 'coralline.omp.json'))
+            $text = '"' + $exe + '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+                $wrapper + '" -Config "' + $configPath + '"'
+            if ($Pinned.Length -gt 0) { $text += ' -OmpExe "' + $Pinned + '"' }
+            return $text
+        }
+
+        function Get-OmpValue([string]$Install, [string]$Pinned = '') {
+            return '{"type":"command","command":' + (ConvertTo-TestJsonString (Get-OmpCommand $Install $Pinned)) +
+                ',"refreshInterval":2}'
+        }
+
+        function Get-OmpWrapperCommand([string]$Install) {
+            $exe = [IO.Path]::GetFullPath((Join-Path $PSHOME 'powershell.exe'))
+            $wrapper = [IO.Path]::GetFullPath((Join-Path $Install 'statusline-omp.ps1'))
+            return '"' + $exe + '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $wrapper + '"'
+        }
+
+        function Copy-OmpSource([string]$Destination) {
+            Copy-ManagedSource $Destination
+            foreach ($relative in @('statusline-omp.ps1', 'tools\build-omp-config.ps1')) {
+                $target = Join-Path $Destination $relative
+                [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+                [IO.File]::Copy((Join-Path $Repo $relative), $target, $true)
+            }
+        }
+
+        function Invoke-OmpDirectGenerator([string]$Install, [string]$Config, [string]$Output, [string]$HomeDir) {
+            if ([IO.Directory]::Exists($Output)) { [IO.Directory]::Delete($Output, $true) }
+            [void][IO.Directory]::CreateDirectory($Output)
+            $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+                (Quote-ProcessArgument (Join-Path $Install 'tools\build-omp-config.ps1')) +
+                ' -ConfigPath ' + (Quote-ProcessArgument $Config) +
+                ' -StatuslinePath ' + (Quote-ProcessArgument (Join-Path $Install 'statusline.ps1')) +
+                ' -OutFile ' + (Quote-ProcessArgument (Join-Path $Output 'coralline.omp.json')) +
+                ' -FloatOutFile ' + (Quote-ProcessArgument (Join-Path $Output 'coralline.float.omp.json')) +
+                ' -AutoOutFile ' + (Quote-ProcessArgument (Join-Path $Output 'coralline.auto.omp.json')) +
+                ' -AutoPlaceholder'
+            $environment = @{ HOME = $HomeDir; USERPROFILE = $HomeDir }
+            foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) {
+                $variable = [string]$name
+                if ($variable -like 'CORALLINE_*' -or $variable -like 'REMORA_*') { $environment[$variable] = $null }
+            }
+            return Invoke-CapturedProcess $PowerShellExe $arguments '' $environment $TempRoot 120000
+        }
+
+        function Test-OmpGeneratedEqual([string]$Install, [string]$Output) {
+            foreach ($name in $OmpGenerated) {
+                $installed = Join-Path $Install $name
+                $direct = Join-Path $Output $name
+                if (-not [IO.File]::Exists($installed) -or -not [IO.File]::Exists($direct)) { return $false }
+                if ((Get-FileSha256 $installed) -cne (Get-FileSha256 $direct)) { return $false }
+            }
+            return $true
+        }
+
+        function Test-OmpNoWrite($Before, [string]$Claude) {
+            return (Test-SnapshotsEqual $Before (Get-TreeSnapshot $Claude)) -and (Get-OmpLeftovers $Claude) -eq 0
+        }
+
+        function Read-Text([string]$Path) {
+            return $StrictUtf8.GetString([IO.File]::ReadAllBytes($Path))
+        }
+
+        # -- fresh install, byte equality with a direct generator run, no-op, repair --
+        $omp = New-Paths "omp it's & (fresh)"
+        [void][IO.Directory]::CreateDirectory($omp.Claude)
+        Write-Utf8 $omp.Config ('VL_SEGMENTS="model ctx cost lines"' + "`n")
+        Write-Utf8 $omp.Settings '{"keep":1}'
+        $ompConfHash = Get-FileSha256 $omp.Config
+        $ompFresh = Invoke-OmpInstaller $Repo $omp.Install $omp.Settings
+        $ompFreshOut = Get-OutputText $ompFresh
+        Check 'omp fresh install exit 0 without stderr' ($ompFresh.ExitCode -eq 0 -and $ompFresh.StderrBytes.Length -eq 0)
+        if ($ompFresh.ExitCode -ne 0) { [Console]::Out.WriteLine('DIAG  omp fresh stderr=' + (Get-ErrorText $ompFresh)) }
+        Check 'omp fresh install prints runtime: native (engine omp)' (
+            $ompFreshOut.StartsWith("runtime: native (engine omp)`r`n", [StringComparison]::Ordinal)
+        )
+        Check 'omp fresh install reports no inventory or concurrency error' (
+            -not $ompFreshOut.Contains('unexpected file inventory') -and
+            -not $ompFreshOut.Contains('unexpected directory inventory') -and
+            -not $ompFreshOut.Contains('changed concurrently') -and
+            -not (Get-ErrorText $ompFresh).Contains('unexpected') -and
+            -not (Get-ErrorText $ompFresh).Contains('changed concurrently')
+        )
+        $ompInstalled = @(
+            Get-ChildItem -LiteralPath $omp.Install -File -Recurse |
+                ForEach-Object { $_.FullName.Substring($omp.Install.Length + 1) } |
+                Sort-Object
+        )
+        Check 'omp installs exactly the base payload, wrapper, generator and three configs' (
+            (($OmpManaged | Sort-Object) -join "`n") -ceq ($ompInstalled -join "`n")
+        )
+        Check 'omp installs the wrapper and generator bytes from the source' (
+            (Get-FileSha256 (Join-Path $omp.Install 'statusline-omp.ps1')) -ceq (Get-FileSha256 (Join-Path $Repo 'statusline-omp.ps1')) -and
+            (Get-FileSha256 (Join-Path $omp.Install 'tools\build-omp-config.ps1')) -ceq
+            (Get-FileSha256 (Join-Path $Repo 'tools\build-omp-config.ps1'))
+        )
+        Check 'omp statusLine is the wrapper with -Config, refreshInterval 2, no subagent row' (
+            (Read-Text $omp.Settings) -ceq ('{"keep":1,"statusLine":' + (Get-OmpValue $omp.Install) + '}')
+        )
+        Check 'omp install leaves coralline.conf byte-identical' ((Get-FileSha256 $omp.Config) -ceq $ompConfHash)
+        Check 'omp install leaves no staging or generator directory' ((Get-OmpLeftovers $omp.Claude) -eq 0)
+        $ompDirectOut = Join-Path $TempRoot 'omp-direct-fresh'
+        $ompDirect = Invoke-OmpDirectGenerator $omp.Install $omp.Config $ompDirectOut $omp.Home
+        Check 'omp generated configs equal a direct 5.1 run of the installed generator' (
+            $ompDirect.ExitCode -eq 0 -and (Test-OmpGeneratedEqual $omp.Install $ompDirectOut)
+        )
+        $ompNoUpgrade = $true
+        foreach ($name in $OmpGenerated) {
+            if ((Read-Text (Join-Path $omp.Install $name)) -cmatch '"upgrade"\s*:') { $ompNoUpgrade = $false }
+        }
+        Check 'omp generated configs carry no upgrade key' $ompNoUpgrade
+        Check 'omp auto config is the placeholder when VL_LAYOUT is not auto' (
+            (Read-Text (Join-Path $omp.Install 'coralline.auto.omp.json')).Contains('"CorallineAutoDisabled"')
+        )
+
+        $ompSnapshot = Get-TreeSnapshot $omp.Claude
+        Start-Sleep -Milliseconds 1200
+        $ompNoop = Invoke-OmpInstaller $Repo $omp.Install $omp.Settings
+        Check 'omp identical rerun reports already up to date and changes nothing' (
+            $ompNoop.ExitCode -eq 0 -and
+            $ompNoop.Stdout -ceq "runtime: native (engine omp)`r`ncoralline is already up to date.`r`n" -and
+            (Test-SnapshotsEqual $ompSnapshot (Get-TreeSnapshot $omp.Claude))
+        )
+
+        function Set-OneByteChanged([string]$Path) {
+            $bytes = [IO.File]::ReadAllBytes($Path)
+            $middle = [int]($bytes.Length / 2)
+            $bytes[$middle] = $bytes[$middle] -bxor 1
+            [IO.File]::WriteAllBytes($Path, $bytes)
+        }
+        $ompMono = Join-Path $omp.Install 'themes\mono.conf'
+        Set-OneByteChanged $ompMono
+        $ompBackupsBefore = Get-OmpBackups $omp.Claude
+        $ompBaseRepair = Invoke-OmpInstaller $Repo $omp.Install $omp.Settings
+        $ompBackupsAfter = Get-OmpBackups $omp.Claude
+        Check 'omp rerun reinstalls one changed base file through transaction 1' (
+            $ompBaseRepair.ExitCode -eq 0 -and
+            (Get-FileSha256 $ompMono) -ceq (Get-FileSha256 (Join-Path $Repo 'themes\mono.conf')) -and
+            @($ompBackupsAfter.Runtime).Count -eq @($ompBackupsBefore.Runtime).Count + 1 -and
+            @($ompBackupsAfter.Generated).Count -eq @($ompBackupsBefore.Generated).Count -and
+            (Get-OutputText $ompBaseRepair).Contains('runtime backup retained at') -and
+            -not (Get-OutputText $ompBaseRepair).Contains('already up to date')
+        )
+
+        $ompFloat = Join-Path $omp.Install 'coralline.float.omp.json'
+        $ompFloatGood = Get-FileSha256 $ompFloat
+        Set-OneByteChanged $ompFloat
+        $ompBackupsBefore = Get-OmpBackups $omp.Claude
+        $ompGeneratedRepair = Invoke-OmpInstaller $Repo $omp.Install $omp.Settings
+        $ompBackupsAfter = Get-OmpBackups $omp.Claude
+        Check 'omp rerun restores one changed generated config through transaction 2' (
+            $ompGeneratedRepair.ExitCode -eq 0 -and
+            (Get-FileSha256 $ompFloat) -ceq $ompFloatGood -and
+            @($ompBackupsAfter.Generated).Count -eq @($ompBackupsBefore.Generated).Count + 1 -and
+            @($ompBackupsAfter.Runtime).Count -eq @($ompBackupsBefore.Runtime).Count -and
+            (Get-OutputText $ompGeneratedRepair).Contains('generated config backup retained at') -and
+            -not (Get-OutputText $ompGeneratedRepair).Contains('runtime backup retained at')
+        )
+
+        Write-Utf8 $omp.Config ('VL_SEGMENTS="model ctx cost"' + "`n")
+        $ompConfHash = Get-FileSha256 $omp.Config
+        $ompBackupsBefore = Get-OmpBackups $omp.Claude
+        $ompBaseBefore = Get-RelativeFileSnapshot $omp.Install $OmpBaseManaged $true
+        $ompConfRun = Invoke-OmpInstaller $Repo $omp.Install $omp.Settings
+        $ompBackupsAfter = Get-OmpBackups $omp.Claude
+        $ompDirect = Invoke-OmpDirectGenerator $omp.Install $omp.Config $ompDirectOut $omp.Home
+        Check 'omp conf-only change runs only transaction 2' (
+            $ompConfRun.ExitCode -eq 0 -and
+            (Test-SnapshotsEqual $ompBaseBefore (Get-RelativeFileSnapshot $omp.Install $OmpBaseManaged $true)) -and
+            @($ompBackupsAfter.Runtime).Count -eq @($ompBackupsBefore.Runtime).Count -and
+            @($ompBackupsAfter.Generated).Count -eq @($ompBackupsBefore.Generated).Count + 1 -and
+            (Get-OutputText $ompConfRun).Contains('generated config backup retained at')
+        )
+        Check 'omp conf-only change regenerates the same bytes as a direct run' (
+            $ompDirect.ExitCode -eq 0 -and (Test-OmpGeneratedEqual $omp.Install $ompDirectOut)
+        )
+        Check 'omp conf-only rerun leaves coralline.conf byte-identical' ((Get-FileSha256 $omp.Config) -ceq $ompConfHash)
+
+        # -- generator warnings (a conf the parser rejects) are forwarded, install continues --
+        $ompWarn = New-Paths 'omp-conf-warning'
+        [void][IO.Directory]::CreateDirectory($ompWarn.Claude)
+        Write-Utf8 $ompWarn.Config ('VL_STYLE=$(evil)' + "`n")
+        $ompWarnRun = Invoke-OmpInstaller $Repo $ompWarn.Install $ompWarn.Settings
+        Check 'omp forwards the generator warning for a rejected conf and still installs' (
+            $ompWarnRun.ExitCode -eq 0 -and
+            (Get-OutputText $ompWarnRun).Contains('warning: ') -and
+            (Get-OutputText $ompWarnRun).Contains('was rejected by the coralline parser') -and
+            [IO.File]::Exists((Join-Path $ompWarn.Install 'coralline.omp.json'))
+        )
+
+        # -- themes: the generator reads the themes this same run installed ------------
+        $ompTheme = New-Paths 'omp-theme-include'
+        [void][IO.Directory]::CreateDirectory($ompTheme.Claude)
+        Write-Utf8 $ompTheme.Config (
+            '. "' + $ompTheme.Install.Replace('\', '/') + '/themes/claude-coral.conf"' + "`n"
+        )
+        $ompThemeSourceA = Join-Path $TempRoot 'omp-theme-source-a'
+        Copy-OmpSource $ompThemeSourceA
+        # claude-coral is the default palette, so the shipped file would be
+        # indistinguishable from the defaults; a changed copy proves the include.
+        $ompCoralA = Join-Path $ompThemeSourceA 'themes\claude-coral.conf'
+        [IO.File]::WriteAllText($ompCoralA, ([IO.File]::ReadAllText($ompCoralA, $StrictUtf8).Replace(
+            'VL_BG_DIR="81,166,199"', 'VL_BG_DIR="11,22,33"'
+        )), $Utf8NoBom)
+        $ompThemeRunA = Invoke-OmpInstaller $ompThemeSourceA $ompTheme.Install $ompTheme.Settings
+        $ompThemeDirect = Join-Path $TempRoot 'omp-direct-theme'
+        $ompThemeDirectRun = Invoke-OmpDirectGenerator $ompTheme.Install $ompTheme.Config $ompThemeDirect $ompTheme.Home
+        $ompDefaultConf = Join-Path $TempRoot 'omp-default.conf'
+        Write-Utf8 $ompDefaultConf ('# defaults' + "`n")
+        $ompDefaultDirect = Join-Path $TempRoot 'omp-direct-default'
+        [void](Invoke-OmpDirectGenerator $ompTheme.Install $ompDefaultConf $ompDefaultDirect $ompTheme.Home)
+        $ompThemeMainA = Get-FileSha256 (Join-Path $ompTheme.Install 'coralline.omp.json')
+        Check 'omp first install generates from the theme it just installed' (
+            $ompThemeRunA.ExitCode -eq 0 -and $ompThemeDirectRun.ExitCode -eq 0 -and
+            (Test-OmpGeneratedEqual $ompTheme.Install $ompThemeDirect) -and
+            $ompThemeMainA -cne (Get-FileSha256 (Join-Path $ompDefaultDirect 'coralline.omp.json'))
+        )
+        $ompThemeSourceB = Join-Path $TempRoot 'omp-theme-source-b'
+        Copy-OmpSource $ompThemeSourceB
+        $ompCoralB = Join-Path $ompThemeSourceB 'themes\claude-coral.conf'
+        [IO.File]::WriteAllText($ompCoralB, ([IO.File]::ReadAllText($ompCoralB, $StrictUtf8).Replace(
+            'VL_BG_DIR="81,166,199"', 'VL_BG_DIR="44,55,66"'
+        )), $Utf8NoBom)
+        $ompThemeRunB = Invoke-OmpInstaller $ompThemeSourceB $ompTheme.Install $ompTheme.Settings
+        $ompThemeDirectRun = Invoke-OmpDirectGenerator $ompTheme.Install $ompTheme.Config $ompThemeDirect $ompTheme.Home
+        Check 'omp upgrade over an older installed theme generates from the new theme' (
+            $ompThemeRunB.ExitCode -eq 0 -and $ompThemeDirectRun.ExitCode -eq 0 -and
+            (Get-FileSha256 (Join-Path $ompTheme.Install 'themes\claude-coral.conf')) -ceq (Get-FileSha256 $ompCoralB) -and
+            (Test-OmpGeneratedEqual $ompTheme.Install $ompThemeDirect) -and
+            (Get-FileSha256 (Join-Path $ompTheme.Install 'coralline.omp.json')) -cne $ompThemeMainA
+        )
+
+        # -- refusals before anything is written --------------------------------------
+        $ompRefusalCases = @(
+            [pscustomobject]@{ Name = 'omp with -Runtime bash'; Args = @('-Engine', 'omp', '-Runtime', 'bash'); PathValue = $ompOkPath; Installer = $Installer; Needle = 'needs the native runtime' },
+            [pscustomobject]@{ Name = '-OmpPath without -Engine omp'; Args = @('-Runtime', 'native', '-OmpPath', (Join-Path $ompOkDir 'oh-my-posh.exe')); PathValue = $ompOkPath; Installer = $Installer; Needle = '-OmpPath needs -Engine omp' },
+            [pscustomobject]@{ Name = 'omp without oh-my-posh on PATH'; Args = @('-Engine', 'omp'); PathValue = $ompSystemPath; Installer = $Installer; Needle = 'was not found on PATH' },
+            [pscustomobject]@{ Name = 'omp with oh-my-posh 31.2.9'; Args = @('-Engine', 'omp'); PathValue = ((New-OmpStubDirectory 'old' 'version:31.2.9') + ';' + $ompSystemPath); Installer = $Installer; Needle = 'is older than' },
+            [pscustomobject]@{ Name = 'omp with a version probe that times out'; Args = @('-Engine', 'omp'); PathValue = ((New-OmpStubDirectory 'sleep' 'sleep') + ';' + $ompSystemPath); Installer = (New-StubInstaller 'stub-omp-version-timeout' '$script:OmpVersionTimeoutMs = 2000'); Needle = 'did not answer' },
+            [pscustomobject]@{ Name = 'omp with a version answer over 4 KB'; Args = @('-Engine', 'omp'); PathValue = ((New-OmpStubDirectory 'big' 'big') + ';' + $ompSystemPath); Installer = $Installer; Needle = 'printed more than' },
+            [pscustomobject]@{ Name = 'omp with an empty version answer'; Args = @('-Engine', 'omp'); PathValue = ((New-OmpStubDirectory 'empty' 'empty') + ';' + $ompSystemPath); Installer = $Installer; Needle = 'printed no version number' },
+            [pscustomobject]@{ Name = 'omp with too many version digits'; Args = @('-Engine', 'omp'); PathValue = ((New-OmpStubDirectory 'digits' 'version:1234567.0.0') + ';' + $ompSystemPath); Installer = $Installer; Needle = 'printed no version number' },
+            [pscustomobject]@{ Name = 'omp with a failing version probe'; Args = @('-Engine', 'omp'); PathValue = ((New-OmpStubDirectory 'exit1' 'exit1') + ';' + $ompSystemPath); Installer = $Installer; Needle = 'exited with 1' },
+            [pscustomobject]@{ Name = 'omp with an elevated token'; Args = @('-Engine', 'omp'); PathValue = $ompOkPath; Installer = (New-StubInstaller 'stub-omp-elevated' 'function Test-InstallerElevated { return $true }'); Needle = 'refuses an elevated' },
+            [pscustomobject]@{ Name = 'omp with a relative -OmpPath'; Args = @('-Engine', 'omp', '-OmpPath', 'oh-my-posh.exe'); PathValue = $ompOkPath; Installer = $Installer; Needle = 'must be absolute' },
+            [pscustomobject]@{ Name = 'omp with -OmpPath not named oh-my-posh.exe'; Args = @('-Engine', 'omp', '-OmpPath', (Join-Path (New-OmpStubDirectory 'renamed' 'version:31.3.0' 'omp.exe') 'omp.exe')); PathValue = $ompOkPath; Installer = $Installer; Needle = 'must name oh-my-posh.exe' },
+            [pscustomobject]@{ Name = 'omp with -OmpPath that does not exist'; Args = @('-Engine', 'omp', '-OmpPath', (Join-Path $TempRoot 'no-such\oh-my-posh.exe')); PathValue = $ompOkPath; Installer = $Installer; Needle = 'does not exist' },
+            [pscustomobject]@{ Name = 'omp with Engine OMP (wrong case)'; Args = @('-Engine', 'OMP'); PathValue = $ompOkPath; Installer = $Installer; Needle = 'Engine' }
+        )
+        $ompCmdOnlyDir = Join-Path $TempRoot 'omp-stub cmd-only'
+        [void][IO.Directory]::CreateDirectory($ompCmdOnlyDir)
+        Write-Utf8 (Join-Path $ompCmdOnlyDir 'oh-my-posh.cmd') ('@echo 31.3.0' + "`r`n")
+        $ompRefusalCases += [pscustomobject]@{ Name = 'omp with only oh-my-posh.cmd on PATH'; Args = @('-Engine', 'omp'); PathValue = ($ompCmdOnlyDir + ';' + $ompSystemPath); Installer = $Installer; Needle = 'not an .exe' }
+        $ompJunctionTarget = Join-Path $TempRoot 'omp-junction-target'
+        $ompJunction = Join-Path $TempRoot 'omp-junction'
+        [void][IO.Directory]::CreateDirectory($ompJunctionTarget)
+        [IO.File]::Copy($ompStubExe, (Join-Path $ompJunctionTarget 'oh-my-posh.exe'), $true)
+        $ompJunctionCreate = Invoke-CapturedProcess $env:ComSpec (
+            '/d /s /c "mklink /J ' + (Quote-ProcessArgument $ompJunction) + ' ' + (Quote-ProcessArgument $ompJunctionTarget) + '"'
+        ) '' @{} $TempRoot 10000
+        $ompJunctionReady = $ompJunctionCreate.ExitCode -eq 0 -and [IO.Directory]::Exists($ompJunction)
+        if ($ompJunctionReady) {
+            $ompRefusalCases += [pscustomobject]@{ Name = 'omp with -OmpPath through a reparse point'; Args = @('-Engine', 'omp', '-OmpPath', (Join-Path $ompJunction 'oh-my-posh.exe')); PathValue = $ompOkPath; Installer = $Installer; Needle = 'reparse point' }
+        } else {
+            Blocked 'omp with -OmpPath through a reparse point' 'mklink /J was unavailable in this Windows environment'
+        }
+        $ompRefusalIndex = 0
+        foreach ($case in $ompRefusalCases) {
+            $ompRefusalIndex++
+            $refused = New-Paths ('omp-refusal-' + $ompRefusalIndex)
+            [void][IO.Directory]::CreateDirectory($refused.Claude)
+            Write-Utf8 $refused.Settings '{"keep":true}'
+            Write-Utf8 $refused.Config ('VL_STYLE="lean"' + "`n")
+            $refusedBefore = Get-TreeSnapshot $refused.Claude
+            $refusedRun = Invoke-OmpInstaller $Repo $refused.Install $refused.Settings $case.Args $case.PathValue $case.Installer
+            Check "$($case.Name) is refused" (
+                -not $refusedRun.TimedOut -and $refusedRun.ExitCode -ne 0 -and
+                (Get-ErrorText $refusedRun).Contains($case.Needle)
+            )
+            if (-not (Get-ErrorText $refusedRun).Contains($case.Needle)) {
+                [Console]::Out.WriteLine('DIAG  ' + $case.Name + ' stderr=' + (Get-ErrorText $refusedRun))
+            }
+            Check "$($case.Name) writes nothing" (
+                (Test-OmpNoWrite $refusedBefore $refused.Claude) -and -not [IO.Directory]::Exists($refused.Install)
+            )
+        }
+        if ($ompJunctionReady) {
+            [void](Invoke-CapturedProcess $env:ComSpec ('/d /s /c "rmdir ' + (Quote-ProcessArgument $ompJunction) + '"') '' @{} $TempRoot 10000)
+        }
+        Blocked 'omp refusal under a real elevated token' 'this test host token is not elevated; the refusal branch is covered by the Test-InstallerElevated stub above'
+
+        $ompStderrFlood = New-Paths 'omp-version-stderr-flood'
+        $ompStderrFloodRun = Invoke-OmpInstaller $Repo $ompStderrFlood.Install $ompStderrFlood.Settings @('-Engine', 'omp') (
+            (New-OmpStubDirectory 'stderr' 'stderr') + ';' + $ompSystemPath
+        )
+        Check 'omp version probe drains 4 MB of stderr and still accepts 31.3.0' ($ompStderrFloodRun.ExitCode -eq 0)
+
+        # -- settings rejected by the parser: exit 1 and not one byte written (H3) --------
+        $ompBadSettings = New-Paths 'omp-malformed-settings'
+        [void][IO.Directory]::CreateDirectory($ompBadSettings.Claude)
+        Write-Utf8 $ompBadSettings.Settings '{"x":'
+        Write-Utf8 $ompBadSettings.Config ('VL_STYLE="lean"' + "`n")
+        $ompBadBefore = Get-TreeSnapshot $ompBadSettings.Claude
+        $ompBadRun = Invoke-OmpInstaller $Repo $ompBadSettings.Install $ompBadSettings.Settings
+        Check 'omp first install with malformed settings exits 1 and writes nothing' (
+            $ompBadRun.ExitCode -eq 1 -and
+            (Test-OmpNoWrite $ompBadBefore $ompBadSettings.Claude) -and
+            -not [IO.Directory]::Exists($ompBadSettings.Install) -and
+            @((Get-OmpBackups $ompBadSettings.Claude).Runtime).Count -eq 0 -and
+            @((Get-OmpBackups $ompBadSettings.Claude).Generated).Count -eq 0
+        )
+
+        # -- -OmpPath pins an absolute oh-my-posh.exe ------------------------------------
+        $ompPinned = New-Paths 'omp-pinned'
+        $ompPinnedExe = Join-Path (New-OmpStubDirectory 'pinned' 'version:31.3.0') 'oh-my-posh.exe'
+        $ompPinnedRun = Invoke-OmpInstaller $Repo $ompPinned.Install $ompPinned.Settings @(
+            '-Engine', 'omp', '-OmpPath', $ompPinnedExe
+        ) $ompSystemPath
+        Check 'omp -OmpPath appends -OmpExe with the exact path (probe did not need PATH)' (
+            $ompPinnedRun.ExitCode -eq 0 -and
+            (Read-Text $ompPinned.Settings) -ceq ('{"statusLine":' + (Get-OmpValue $ompPinned.Install $ompPinnedExe) + '}')
+        )
+
+        # -- G7: install-time inputs versus render-time inputs ----------------------------
+        $ompNotes = New-Paths 'omp-env-notes'
+        $ompNotesRun = Invoke-OmpInstaller $Repo $ompNotes.Install $ompNotes.Settings @('-Engine', 'omp') $ompOkPath $Installer @{
+            CORALLINE_CONFIG = (Join-Path $TempRoot 'elsewhere.conf')
+            CORALLINE_OMP_EXE = (Join-Path $TempRoot 'elsewhere\oh-my-posh.exe')
+            CORALLINE_OMP_CONFIG = (Join-Path $TempRoot 'elsewhere.omp.json')
+        }
+        Check 'omp prints notes for CORALLINE_CONFIG, CORALLINE_OMP_EXE and CORALLINE_OMP_CONFIG' (
+            $ompNotesRun.ExitCode -eq 0 -and
+            (Get-OutputText $ompNotesRun).Contains('note: CORALLINE_CONFIG is set') -and
+            (Get-OutputText $ompNotesRun).Contains('note: CORALLINE_OMP_EXE is set') -and
+            (Get-OutputText $ompNotesRun).Contains('note: CORALLINE_OMP_CONFIG is set')
+        )
+
+        # -- generator failures after transaction 1 (stub generators, Local mode) ----------
+        $ompStubGeneratorHead = (
+            'param([string]$ConfigPath, [string]$StatuslinePath, [string]$OutFile, [string]$FloatOutFile, ' +
+            '[string]$AutoOutFile, [switch]$AutoPlaceholder)' + "`n" +
+            '$u = New-Object System.Text.UTF8Encoding($false)' + "`n" +
+            '$valid = "{`n  `"var`": {`n    `"CorallineGenerator`": `"coralline-omp/1`"`n  }`n}`n"' + "`n" +
+            'function Write-All([string]$Main) { [IO.File]::WriteAllText($OutFile, $Main, $u); ' +
+            '[IO.File]::WriteAllText($FloatOutFile, $valid, $u); [IO.File]::WriteAllText($AutoOutFile, $valid, $u) }' + "`n"
+        )
+        $ompGeneratorModes = @(
+            [pscustomobject]@{ Name = 'exit 1'; Body = '[Console]::Error.WriteLine("stub generator failure"); exit 1'; Needle = 'exited with 1'; Installer = $Installer },
+            [pscustomobject]@{ Name = 'timeout'; Body = 'Start-Sleep -Seconds 30'; Needle = 'did not finish within'; Installer = (New-StubInstaller 'stub-omp-generator-timeout' '$script:OmpGeneratorTimeoutMs = 3000') },
+            [pscustomobject]@{ Name = 'non-ASCII output'; Body = 'Write-All ($valid + "caf" + [char]0xE9 + "`n")'; Needle = 'is not ASCII'; Installer = $Installer },
+            [pscustomobject]@{ Name = 'missing marker'; Body = 'Write-All ("{}" + "`n")'; Needle = 'lacks the coralline-omp generator marker'; Installer = $Installer },
+            [pscustomobject]@{ Name = 'upgrade key'; Body = 'Write-All ($valid.Replace("{`n  `"var`"", "{`n  `"upgrade`": {},`n  `"var`""))'; Needle = 'contains an upgrade key'; Installer = $Installer },
+            [pscustomobject]@{ Name = 'extra file'; Body = 'Write-All $valid; [IO.File]::WriteAllText([IO.Path]::Combine([IO.Path]::GetDirectoryName($OutFile), "extra.json"), $valid, $u)'; Needle = 'unexpected file inventory'; Installer = $Installer },
+            [pscustomobject]@{ Name = 'oversized output'; Body = 'Write-All ($valid + (New-Object string ([char]32, 1048577)))'; Needle = 'exceeds the'; Installer = $Installer },
+            [pscustomobject]@{ Name = 'stdout flood'; Body = 'Write-All $valid; [Console]::Out.Write((New-Object string ([char]120, 70000)))'; Needle = 'printed more than'; Installer = $Installer },
+            [pscustomobject]@{ Name = 'reparse point'; Body = ('Write-All $valid; $d = [IO.Path]::GetDirectoryName($OutFile); ' +
+                '$t = [IO.Path]::Combine([IO.Path]::GetDirectoryName($d), "omp-junction-target"); [void][IO.Directory]::CreateDirectory($t); ' +
+                'New-Item -ItemType Junction -Path ([IO.Path]::Combine($d, "junction")) -Target $t | Out-Null'); Needle = 'reparse point'; Installer = $Installer },
+            [pscustomobject]@{ Name = 'tampered installed runtime'; Body = 'Write-All $valid; [IO.File]::AppendAllText($StatuslinePath, "`n# tampered`n")'; Needle = 'changed concurrently'; Installer = $Installer }
+        )
+        $ompGen = New-Paths 'omp-generator-failures'
+        [void][IO.Directory]::CreateDirectory($ompGen.Claude)
+        Write-Utf8 $ompGen.Config ('VL_STYLE="lean"' + "`n")
+        $ompGenGood = Invoke-OmpInstaller $Repo $ompGen.Install $ompGen.Settings
+        Check 'omp generator-failure fixture installs' ($ompGenGood.ExitCode -eq 0)
+        $ompGenSource = Join-Path $TempRoot 'omp-generator-stub-source'
+        Copy-OmpSource $ompGenSource
+        $ompGenStub = Join-Path $ompGenSource 'tools\build-omp-config.ps1'
+        foreach ($mode in $ompGeneratorModes) {
+            if ($mode.Name -ceq 'tampered installed runtime') {
+                # Put the fixture back to the shipped runtime first.
+                [void](Invoke-OmpInstaller $Repo $ompGen.Install $ompGen.Settings)
+            }
+            Write-Utf8 $ompGenStub ($ompStubGeneratorHead + $mode.Body + "`n")
+            $genBefore = Get-TreeSnapshot $ompGen.Install
+            $genSettingsBefore = Get-FileSha256 $ompGen.Settings
+            $genRun = Invoke-OmpInstaller $ompGenSource $ompGen.Install $ompGen.Settings @('-Engine', 'omp') $ompOkPath $mode.Installer
+            $genError = Get-ErrorText $genRun
+            Check "omp generator $($mode.Name) fails the install" (
+                -not $genRun.TimedOut -and $genRun.ExitCode -ne 0 -and $genError.Contains($mode.Needle)
+            )
+            if (-not $genError.Contains($mode.Needle)) { [Console]::Out.WriteLine("DIAG  generator $($mode.Name) stderr=$genError") }
+            $genAfter = Get-TreeSnapshot $ompGen.Install
+            if ($mode.Name -ceq 'tampered installed runtime') {
+                $genAfter.Remove('file:\statusline.ps1')
+                $genBefore.Remove('file:\statusline.ps1')
+            }
+            Check "omp generator $($mode.Name) rolls transaction 1 back byte for byte" (
+                $genError.Contains('previous managed runtime restored') -and
+                (Test-SnapshotsEqual $genBefore $genAfter) -and
+                (Get-FileSha256 $ompGen.Settings) -ceq $genSettingsBefore
+            )
+            if ($mode.Name -ceq 'reparse point') {
+                foreach ($leftover in @([IO.Directory]::GetDirectories($ompGen.Claude, '.coralline.generate.*'))) {
+                    $leftoverJunction = Join-Path $leftover 'junction'
+                    if ([IO.Directory]::Exists($leftoverJunction)) {
+                        [void](Invoke-CapturedProcess $env:ComSpec ('/d /s /c "rmdir ' + (Quote-ProcessArgument $leftoverJunction) + '"') '' @{} $TempRoot 10000)
+                    }
+                    if (-not [IO.Directory]::Exists($leftoverJunction)) { [IO.Directory]::Delete($leftover, $true) }
+                }
+            }
+        }
+        Check 'omp generator failures leave no generator directory behind' ((Get-OmpLeftovers $ompGen.Claude) -eq 0)
+
+        $ompGenFirst = New-Paths 'omp-generator-failure-first-install'
+        [void][IO.Directory]::CreateDirectory($ompGenFirst.Claude)
+        Write-Utf8 $ompGenFirst.Settings '{"keep":true}'
+        $ompGenFirstSettings = Get-FileSha256 $ompGenFirst.Settings
+        Write-Utf8 $ompGenStub ($ompStubGeneratorHead + '[Console]::Error.WriteLine("stub generator failure"); exit 1' + "`n")
+        $ompGenFirstRun = Invoke-OmpInstaller $ompGenSource $ompGenFirst.Install $ompGenFirst.Settings
+        Check 'omp generator failure on a first install fails closed and leaves settings untouched' (
+            $ompGenFirstRun.ExitCode -ne 0 -and
+            (Get-ErrorText $ompGenFirstRun).Contains('multi-file runtime rollback requires manual recovery') -and
+            (Get-FileSha256 $ompGenFirst.Settings) -ceq $ompGenFirstSettings
+        )
+
+        # -- settings commit failure: reverse rollback of both transactions ---------------
+        $ompRb = New-Paths 'omp-settings-rollback'
+        [void][IO.Directory]::CreateDirectory($ompRb.Claude)
+        Write-Utf8 $ompRb.Config ('VL_LAYOUT="auto"' + "`n" + 'VL_MAX_LINES="3"' + "`n" + 'VL_SEGMENTS="model ctx cost"' + "`n")
+        Write-Utf8 $ompRb.Settings '{"keep":1}'
+        $ompRbFresh = Invoke-OmpInstaller $Repo $ompRb.Install $ompRb.Settings
+        Check 'omp rollback fixture installs a real auto config' (
+            $ompRbFresh.ExitCode -eq 0 -and
+            (Read-Text (Join-Path $ompRb.Install 'coralline.auto.omp.json')).Contains('"CorallineAutoTokens"')
+        )
+        function Invoke-OmpLocked([string]$Source) {
+            $lock = [IO.File]::Open($ompRb.Settings, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try { return Invoke-OmpInstaller $Source $ompRb.Install $ompRb.Settings }
+            finally { $lock.Dispose() }
+        }
+        Write-Utf8 $ompRb.Settings '{"keep":1,"statusLine":null}'
+        $ompRbSettings = Get-FileSha256 $ompRb.Settings
+        Write-Utf8 $ompRb.Config ('VL_LAYOUT="auto"' + "`n" + 'VL_MAX_LINES="1"' + "`n" + 'VL_SEGMENTS="model ctx cost"' + "`n")
+        $ompRbBefore = Get-TreeSnapshot $ompRb.Install
+        $ompRbRun = Invoke-OmpLocked $Repo
+        Check 'omp settings failure with only auto changed restores auto byte for byte' (
+            $ompRbRun.ExitCode -ne 0 -and
+            (Get-ErrorText $ompRbRun).Contains('previous managed runtime and generated configs restored') -and
+            (Test-SnapshotsEqual $ompRbBefore (Get-TreeSnapshot $ompRb.Install)) -and
+            (Get-FileSha256 $ompRb.Settings) -ceq $ompRbSettings
+        )
+        $ompRbSource = Join-Path $TempRoot 'omp-rollback-source'
+        Copy-OmpSource $ompRbSource
+        [IO.File]::AppendAllText((Join-Path $ompRbSource 'themes\mono.conf'), ("`n# rollback`n"), $Utf8NoBom)
+        $ompRbRun = Invoke-OmpLocked $ompRbSource
+        Check 'omp settings failure with one base file and auto changed restores both byte for byte' (
+            $ompRbRun.ExitCode -ne 0 -and
+            (Get-ErrorText $ompRbRun).Contains('previous managed runtime and generated configs restored') -and
+            (Test-SnapshotsEqual $ompRbBefore (Get-TreeSnapshot $ompRb.Install)) -and
+            (Get-FileSha256 $ompRb.Settings) -ceq $ompRbSettings
+        )
+        Write-Utf8 $ompRb.Config (
+            '. "' + $ompRb.Install.Replace('\', '/') + '/themes/dracula.conf"' + "`n" +
+            'VL_LAYOUT="auto"' + "`n" + 'VL_MAX_LINES="3"' + "`n" + 'VL_SEGMENTS="model ctx cost git"' + "`n" +
+            'VL_FLOAT_SEGMENTS="model ctx"' + "`n"
+        )
+        $ompRbOldGenerated = Get-RelativeFileSnapshot $ompRb.Install $OmpGenerated $false
+        $ompRbOldMono = Get-FileSha256 (Join-Path $ompRb.Install 'themes\mono.conf')
+        $ompRbBackupsBefore = Get-OmpBackups $ompRb.Claude
+        $ompRbRun = Invoke-OmpLocked $ompRbSource
+        $ompRbBackupsAfter = Get-OmpBackups $ompRb.Claude
+        $ompRbNewRuntime = @($ompRbBackupsAfter.Runtime | Where-Object { @($ompRbBackupsBefore.Runtime) -notcontains $_ })
+        $ompRbNewGenerated = @($ompRbBackupsAfter.Generated | Where-Object { @($ompRbBackupsBefore.Generated) -notcontains $_ })
+        $ompRbDirectRun = Invoke-OmpDirectGenerator $ompRb.Install $ompRb.Config (Join-Path $TempRoot 'omp-direct-rollback') $ompRb.Home
+        $ompRbKept = $ompRbNewRuntime.Count -eq 1 -and $ompRbNewGenerated.Count -eq 1
+        if ($ompRbKept) {
+            foreach ($name in $OmpGenerated) {
+                if ((Get-FileSha256 (Join-Path $ompRbNewGenerated[0] $name)) -cne $ompRbOldGenerated[$name]) { $ompRbKept = $false }
+            }
+            if ((Get-FileSha256 (Join-Path $ompRbNewRuntime[0] 'themes\mono.conf')) -cne $ompRbOldMono) { $ompRbKept = $false }
+        }
+        $ompRbError = Get-ErrorText $ompRbRun
+        Check 'omp settings failure with a multi-file transaction 2 fails closed and names both backups' (
+            $ompRbRun.ExitCode -ne 0 -and
+            $ompRbError.Contains('multi-file runtime rollback requires manual recovery') -and
+            $ompRbNewRuntime.Count -eq 1 -and $ompRbError.Contains([IO.Path]::GetFileName($ompRbNewRuntime[0])) -and
+            $ompRbNewGenerated.Count -eq 1 -and $ompRbError.Contains([IO.Path]::GetFileName($ompRbNewGenerated[0]))
+        )
+        Check 'omp fail-closed rollback leaves transaction 1, every target and both backups untouched' (
+            $ompRbKept -and $ompRbDirectRun.ExitCode -eq 0 -and
+            (Test-OmpGeneratedEqual $ompRb.Install (Join-Path $TempRoot 'omp-direct-rollback')) -and
+            (Get-FileSha256 (Join-Path $ompRb.Install 'themes\mono.conf')) -ceq
+            (Get-FileSha256 (Join-Path $ompRbSource 'themes\mono.conf')) -and
+            (Get-FileSha256 $ompRb.Settings) -ceq $ompRbSettings
+        )
+
+        # -- G11: a generated config held open by a reader ---------------------------------
+        $ompLocked = New-Paths 'omp-locked-config'
+        [void][IO.Directory]::CreateDirectory($ompLocked.Claude)
+        Write-Utf8 $ompLocked.Config ('VL_SEGMENTS="model ctx cost"' + "`n")
+        $ompLockedFresh = Invoke-OmpInstaller $Repo $ompLocked.Install $ompLocked.Settings
+        Write-Utf8 $ompLocked.Config ('VL_SEGMENTS="model ctx"' + "`n" + 'VL_FLOAT_SEGMENTS="model"' + "`n")
+        $ompLockedBefore = Get-TreeSnapshot $ompLocked.Install
+        $ompLockedSettings = Get-FileSha256 $ompLocked.Settings
+        $ompReader = [IO.File]::Open(
+            (Join-Path $ompLocked.Install 'coralline.float.omp.json'),
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+        try {
+            $ompLockedRun = Invoke-OmpInstaller $Repo $ompLocked.Install $ompLocked.Settings
+        } finally {
+            $ompReader.Dispose()
+        }
+        Check 'omp config held open by a reader fails closed and rolls the replaced config back' (
+            $ompLockedFresh.ExitCode -eq 0 -and $ompLockedRun.ExitCode -ne 0 -and
+            (Get-ErrorText $ompLockedRun).Contains('previous managed runtime restored') -and
+            (Test-SnapshotsEqual $ompLockedBefore (Get-TreeSnapshot $ompLocked.Install)) -and
+            (Get-FileSha256 $ompLocked.Settings) -ceq $ompLockedSettings
+        )
+
+        # -- subagent rows -------------------------------------------------------------------
+        $ompSub = New-Paths 'omp-subagent'
+        $ompSubOn = Invoke-OmpInstaller $Repo $ompSub.Install $ompSub.Settings @('-Engine', 'omp', '-SubagentRows', 'on')
+        Check 'omp -SubagentRows on writes the native subagent row' (
+            $ompSubOn.ExitCode -eq 0 -and
+            (Read-Text $ompSub.Settings) -ceq (
+                '{"statusLine":' + (Get-OmpValue $ompSub.Install) + ',"subagentStatusLine":' +
+                (Get-DesiredSubagentValue $ompSub.Install) + '}'
+            )
+        )
+        $ompWrapperRow = Get-OmpWrapperCommand $ompSub.Install
+        $ompOtherRoot = Get-OmpWrapperCommand (Join-Path $TempRoot 'other-root\coralline')
+        $ompBashRow = '"C:\Program Files\Git\bin\bash.exe" "' + $ompSub.Install.Replace('\', '/') + '/statusline.sh" --subagent'
+        $ompSubCases = @(
+            [pscustomobject]@{ Name = 'bare wrapper --subagent row'; Row = ($ompWrapperRow + ' --subagent'); Moves = $true },
+            [pscustomobject]@{ Name = 'wrapper -Config --subagent row'; Row = ($ompWrapperRow + ' -Config "C:\x\coralline.omp.json" --subagent'); Moves = $true },
+            [pscustomobject]@{ Name = 'wrapper -Config -OmpExe --subagent row'; Row = ($ompWrapperRow + ' -Config "C:\x.json" -OmpExe "C:\o\oh-my-posh.exe" --subagent'); Moves = $true },
+            [pscustomobject]@{ Name = 'Bash row for this root'; Row = $ompBashRow; Moves = $true },
+            [pscustomobject]@{ Name = 'wrapper row for another root'; Row = ($ompOtherRoot + ' --subagent'); Moves = $false },
+            [pscustomobject]@{ Name = 'upper-case wrapper row'; Row = ($ompWrapperRow + ' --subagent').ToUpperInvariant(); Moves = $false },
+            [pscustomobject]@{ Name = 'wrapper row with an extra argument'; Row = ($ompWrapperRow + ' --subagent --extra'); Moves = $false },
+            [pscustomobject]@{ Name = 'wrapper row with an extra flag before --subagent'; Row = ($ompWrapperRow + ' -Verbose --subagent'); Moves = $false }
+        )
+        foreach ($case in $ompSubCases) {
+            $rowValue = '{"type":"command","command":' + (ConvertTo-TestJsonString $case.Row) + '}'
+            Write-Utf8 $ompSub.Settings ('{"subagentStatusLine":' + $rowValue + '}')
+            $subRun = Invoke-OmpInstaller $Repo $ompSub.Install $ompSub.Settings
+            $expectedRow = $rowValue
+            if ($case.Moves) { $expectedRow = Get-DesiredSubagentValue $ompSub.Install }
+            $verb = 'is kept'
+            if ($case.Moves) { $verb = 'moves to the native row' }
+            Check "omp preserve: $($case.Name) $verb" (
+                $subRun.ExitCode -eq 0 -and
+                (Read-Text $ompSub.Settings) -ceq (
+                    '{"subagentStatusLine":' + $expectedRow + ',"statusLine":' + (Get-OmpValue $ompSub.Install) + '}'
+                )
+            )
+        }
+        $ompWrapperValue = '{"type":"command","command":' + (ConvertTo-TestJsonString ($ompWrapperRow + ' --subagent')) + '}'
+        Write-Utf8 $ompSub.Settings ('{"subagentStatusLine":' + $ompWrapperValue + '}')
+        $ompSubNative = Invoke-Installer $Repo $ompSub.Install $ompSub.Settings '' 'native'
+        Check 'native rerun keeps a wrapper --subagent row (documented asymmetry)' (
+            $ompSubNative.ExitCode -eq 0 -and
+            (Read-Text $ompSub.Settings) -ceq (
+                '{"subagentStatusLine":' + $ompWrapperValue + ',"statusLine":' + (Get-DesiredValue $ompSub.Install) + '}'
+            )
+        )
+        # Same host gate as the Bash runtime cases above: machine-wide Git Bash that finds jq.
+        $ompBash = Get-ExpectedGitBash
+        $ompBashReason = 'Git for Windows is not installed machine-wide on this host'
+        if ($null -ne $ompBash) {
+            $ompJqProbe = Invoke-CapturedProcess $ompBash '--noprofile --norc -c "command -v jq"' '' @{} $TempRoot 15000
+            if ($ompJqProbe.ExitCode -ne 0) {
+                $ompBashReason = 'Git Bash cannot find jq on this host'
+                $ompBash = $null
+            }
+        }
+        if ($null -ne $ompBash) {
+            $ompBashCommand = '"' + $ompBash + '" "' + [IO.Path]::GetFullPath($ompSub.Install).Replace('\', '/') + '/statusline.sh"'
+            Write-Utf8 $ompSub.Settings ('{"subagentStatusLine":' + (Get-DesiredSubagentValue $ompSub.Install) + '}')
+            [void](Invoke-OmpInstaller $Repo $ompSub.Install $ompSub.Settings)
+            $ompSubAuto = Invoke-Installer $Repo $ompSub.Install $ompSub.Settings '' 'default'
+            Check 'omp then default auto selecting bash moves the native subagent row to bash' (
+                $ompSubAuto.ExitCode -eq 0 -and
+                (Read-Text $ompSub.Settings) -ceq (
+                    '{"subagentStatusLine":{"type":"command","command":' +
+                    (ConvertTo-TestJsonString ($ompBashCommand + ' --subagent')) + '}' +
+                    ',"statusLine":{"type":"command","command":' + (ConvertTo-TestJsonString $ompBashCommand) +
+                    ',"refreshInterval":1}}'
+                )
+            )
+        } else {
+            Blocked 'omp then auto selecting bash' $ompBashReason
+        }
+
+        # -- switching back to native keeps every omp file in place -----------------------
+        $ompSwitch = New-Paths 'omp-switch-native'
+        $ompSwitchFresh = Invoke-OmpInstaller $Repo $ompSwitch.Install $ompSwitch.Settings
+        $ompSwitchFiles = Get-RelativeFileSnapshot $ompSwitch.Install (@('statusline-omp.ps1', 'tools\build-omp-config.ps1') + $OmpGenerated) $true
+        $ompSwitchRun = Invoke-Installer $Repo $ompSwitch.Install $ompSwitch.Settings '' 'native'
+        Check 'native rerun after omp restores the native statusLine' (
+            $ompSwitchFresh.ExitCode -eq 0 -and $ompSwitchRun.ExitCode -eq 0 -and
+            (Read-Text $ompSwitch.Settings) -ceq ('{"statusLine":' + (Get-DesiredValue $ompSwitch.Install) + '}')
+        )
+        Check 'native rerun after omp leaves the wrapper, generator and configs byte-identical' (
+            Test-SnapshotsEqual $ompSwitchFiles (
+                Get-RelativeFileSnapshot $ompSwitch.Install (@('statusline-omp.ps1', 'tools\build-omp-config.ps1') + $OmpGenerated) $true
+            )
+        )
+
+        # -- static check: every managed-list walk in the omp flow goes through Invoke-WithManagedSet --
+        $ompTokens = $null
+        $ompErrors = $null
+        $ompAst = [Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$ompTokens, [ref]$ompErrors)
+        $ompWalkers = @(
+            'Assert-ExpectedManagedInventory', 'Assert-ValidManagedPayload', 'Assert-ValidStagedPayload',
+            'Test-ManagedPayloadEqual', 'Get-ManagedPayloadBytes', 'Assert-ManagedPayloadBytes', 'Install-Runtime',
+            'Undo-RuntimeInstall', 'Restore-ManagedRuntime', 'Remove-EmptyCreatedRuntime',
+            'Stage-LocalPayload', 'Stage-RemotePayload'
+        )
+        $ompUnwrapped = New-Object 'System.Collections.Generic.List[string]'
+        $ompWalkCount = 0
+        foreach ($functionName in @('Invoke-CorallineOmpInstall', 'Undo-OmpInstall')) {
+            $definition = $ompAst.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
+            }, $true)
+            if ($null -eq $definition) { $ompUnwrapped.Add("missing $functionName"); continue }
+            foreach ($call in @($definition.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and $ompWalkers -ccontains $node.GetCommandName()
+            }, $true))) {
+                $ompWalkCount++
+                $wrapped = $false
+                $parent = $call.Parent
+                while ($null -ne $parent -and $parent -ne $definition) {
+                    if ($parent -is [Management.Automation.Language.ScriptBlockExpressionAst] -and
+                        $parent.Parent -is [Management.Automation.Language.CommandAst] -and
+                        $parent.Parent.GetCommandName() -ceq 'Invoke-WithManagedSet') {
+                        $wrapped = $true
+                        break
+                    }
+                    $parent = $parent.Parent
+                }
+                if (-not $wrapped) { $ompUnwrapped.Add($call.Extent.Text) }
+            }
+            if ($definition.Extent.Text.Contains('$script:ManagedFiles =') -or $definition.Extent.Text.Contains('$script:ManagedFiles +=')) {
+                $ompUnwrapped.Add("$functionName assigns the managed list")
+            }
+        }
+        $nativeEntry = $ompAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-CorallineInstall'
+        }, $true)
+        Check 'omp flow walks the managed lists only through Invoke-WithManagedSet (AST)' (
+            $ompErrors.Count -eq 0 -and $ompWalkCount -ge 15 -and $ompUnwrapped.Count -eq 0
+        )
+        if ($ompUnwrapped.Count -gt 0) { [Console]::Out.WriteLine('DIAG  unwrapped: ' + ($ompUnwrapped -join ' | ')) }
+        Check 'native entry point never calls Invoke-WithManagedSet (AST)' (
+            $null -ne $nativeEntry -and
+            @($nativeEntry.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Invoke-WithManagedSet'
+            }, $true)).Count -eq 0
+        )
+        $ompInventoryFunctions = @($ompAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            @('Assert-ExpectedManagedInventory', 'Get-SafeTreeInventory', 'Assert-NoReparsePath') -ccontains $node.Name
+        }, $true) | ForEach-Object { $_.Extent.Text }) -join "`n"
+        $ompInventoryRoot = Join-Path $TempRoot 'omp-inventory-tools'
+        [void][IO.Directory]::CreateDirectory((Join-Path $ompInventoryRoot 'themes'))
+        [void][IO.Directory]::CreateDirectory((Join-Path $ompInventoryRoot 'tools'))
+        Write-Utf8 (Join-Path $ompInventoryRoot 'statusline.ps1') 'x'
+        $ompInventoryCheck = [scriptblock]::Create(
+            'param($EngineValue, $Root) $Engine = $EngineValue; $script:ManagedFiles = @(''statusline.ps1''); ' + $ompInventoryFunctions +
+            "`n" + 'try { Assert-ExpectedManagedInventory $Root ''staged payload''; return ''accepted'' } catch { return $_.Exception.Message }'
+        )
+        $nativeInventory = & $ompInventoryCheck 'native' $ompInventoryRoot
+        $ompInventory = & $ompInventoryCheck 'omp' $ompInventoryRoot
+        Check 'native staging still rejects a tools directory with the upstream error text' (
+            [string]$nativeInventory -ceq 'staged payload has an unexpected directory inventory'
+        )
+        Check 'omp staging accepts exactly themes and tools' ([string]$ompInventory -ceq 'accepted')
+
+        # -- renders through the registered command (real Oh-My-Posh) ------------------------
+        $realOmp = $null
+        foreach ($candidate in @(Get-Command -Name 'oh-my-posh' -CommandType Application -ErrorAction SilentlyContinue)) {
+            if (-not ([string]$candidate.Source).EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $realProbe = Invoke-CapturedProcess ([string]$candidate.Source) 'version' '' @{} $TempRoot 15000
+            $realMatch = [regex]::Match([string]$realProbe.Stdout, '\A([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})')
+            if ($realProbe.ExitCode -eq 0 -and $realMatch.Success -and
+                (New-Object Version([int]$realMatch.Groups[1].Value, [int]$realMatch.Groups[2].Value, [int]$realMatch.Groups[3].Value)) -ge [Version]'31.3.0') {
+                $realOmp = [string]$candidate.Source
+            }
+            break
+        }
+        if ($null -eq $realOmp) {
+            Blocked 'omp renders through the registered command' 'no oh-my-posh.exe 31.3.0 or newer on this host PATH'
+        } else {
+            $realOmpPath = [IO.Path]::GetDirectoryName($realOmp) + ';' + $ompSystemPath
+            $ompGitBash = Get-ExpectedGitBash
+            $ompSample = $StrictUtf8.GetString([IO.File]::ReadAllBytes((Join-Path $Repo 'test\sample-input.json')))
+            # Decoys in the working directory: none may run when a registered command executes.
+            $ompWorkspace = Join-Path $TempRoot 'omp fake workspace'
+            [void][IO.Directory]::CreateDirectory($ompWorkspace)
+            $ompMarker = Join-Path $ompWorkspace 'FAKE-RAN'
+            [IO.File]::WriteAllBytes((Join-Path $ompWorkspace 'powershell.exe'), [byte[]](0x4d, 0x5a, 0, 0))
+            [IO.File]::WriteAllBytes((Join-Path $ompWorkspace 'oh-my-posh.exe'), [byte[]](0x4d, 0x5a, 0, 0))
+            foreach ($decoy in @('powershell.cmd', 'oh-my-posh.cmd', 'statusline-omp.cmd')) {
+                Write-Utf8 (Join-Path $ompWorkspace $decoy) ('@echo fake>"' + $ompMarker + '"')
+            }
+            function Invoke-OmpRender([string]$Shell, [string]$Command, [string]$HomeDir, [string]$PathValue, [string]$ConfPath, [hashtable]$Extra = @{}) {
+                $environment = @{
+                    HOME = $HomeDir
+                    USERPROFILE = $HomeDir
+                    PATH = $PathValue
+                    CORALLINE_NO_SAMPLE = '1'
+                    CLAUDE_CONFIG_DIR = $null
+                    CORALLINE_CONFIG = $ConfPath
+                    CORALLINE_OMP_EXE = $null
+                    CORALLINE_OMP_CONFIG = $null
+                }
+                foreach ($key in $Extra.Keys) { $environment[$key] = $Extra[$key] }
+                switch ($Shell) {
+                    'cmd' { return Invoke-CapturedProcess $env:ComSpec ('/d /s /c "' + $Command + '"') $ompSample $environment $ompWorkspace 60000 }
+                    'bash' { return Invoke-CapturedProcess $ompGitBash ('--noprofile --norc -c ' + (ConvertTo-ProcessArgument $Command)) $ompSample $environment $ompWorkspace 60000 }
+                    default { return Invoke-CapturedProcess $PowerShellExe $Command $ompSample $environment $ompWorkspace 60000 }
+                }
+            }
+
+            $ompRender = [pscustomobject]@{
+                Root = (Join-Path $TempRoot "omp render it's & (x)")
+            }
+            $ompRenderClaude = Join-Path $ompRender.Root 'not-dot-claude'
+            $ompRenderInstall = Join-Path $ompRenderClaude 'coralline'
+            $ompRenderSettings = Join-Path $ompRenderClaude 'settings.json'
+            $ompRenderConf = Join-Path $ompRenderClaude 'coralline.conf'
+            $ompRenderHome = Join-Path $ompRender.Root 'render home'
+            $ompRenderOtherConfig = Join-Path $ompRender.Root 'other claude config'
+            [void][IO.Directory]::CreateDirectory($ompRenderClaude)
+            [void][IO.Directory]::CreateDirectory((Join-Path $ompRenderHome '.claude'))
+            [void][IO.Directory]::CreateDirectory($ompRenderOtherConfig)
+            Write-Utf8 $ompRenderConf ('VL_SEGMENTS="model ctx cost lines"' + "`n")
+            $ompRenderRun = Invoke-OmpInstaller $Repo $ompRenderInstall $ompRenderSettings
+            $ompRenderCommand = Get-OmpCommand $ompRenderInstall
+            Check 'omp installs under a root outside HOME\.claude with space, & and quote' (
+                $ompRenderRun.ExitCode -eq 0 -and
+                (Read-Text $ompRenderSettings) -ceq ('{"statusLine":' + (Get-OmpValue $ompRenderInstall) + '}')
+            )
+            $directArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+                (Quote-ProcessArgument (Join-Path $ompRenderInstall 'statusline-omp.ps1')) + ' -Config ' +
+                (Quote-ProcessArgument (Join-Path $ompRenderInstall 'coralline.omp.json'))
+            $ompDirectRender = Invoke-OmpRender 'direct' $directArguments $ompRenderHome $realOmpPath $ompRenderConf
+            Check 'direct wrapper render of the installed config shows the sample model' (
+                $ompDirectRender.ExitCode -eq 0 -and $null -ne $ompDirectRender.Stdout -and $ompDirectRender.Stdout.Contains('Fable')
+            )
+            $ompShells = @('cmd')
+            if ($null -ne $ompGitBash) { $ompShells += 'bash' } else { Blocked 'omp registered command under Git Bash' 'Git for Windows bash.exe is not installed machine-wide on this host' }
+            foreach ($shell in $ompShells) {
+                $shellRender = Invoke-OmpRender $shell $ompRenderCommand $ompRenderHome $realOmpPath $ompRenderConf
+                Check "omp registered command under $shell renders byte-identical to the direct wrapper run" (
+                    $shellRender.ExitCode -eq 0 -and $shellRender.StderrBytes.Length -eq 0 -and
+                    [Convert]::ToBase64String($shellRender.StdoutBytes) -ceq [Convert]::ToBase64String($ompDirectRender.StdoutBytes)
+                )
+                $shellConfigDir = Invoke-OmpRender $shell $ompRenderCommand $ompRenderHome $realOmpPath $ompRenderConf @{ CLAUDE_CONFIG_DIR = $ompRenderOtherConfig }
+                Check "omp registered command under $shell ignores CLAUDE_CONFIG_DIR thanks to -Config" (
+                    $shellConfigDir.ExitCode -eq 0 -and
+                    [Convert]::ToBase64String($shellConfigDir.StdoutBytes) -ceq [Convert]::ToBase64String($ompDirectRender.StdoutBytes)
+                )
+            }
+            $noConfigArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+                (Quote-ProcessArgument (Join-Path $ompRenderInstall 'statusline-omp.ps1'))
+            $ompNoConfigRender = Invoke-OmpRender 'direct' $noConfigArguments $ompRenderHome $realOmpPath $ompRenderConf @{ CLAUDE_CONFIG_DIR = $ompRenderOtherConfig }
+            Check 'without -Config the same environment finds no config (so -Config is what renders)' (
+                $ompNoConfigRender.ExitCode -eq 0 -and
+                [Convert]::ToBase64String($ompNoConfigRender.StdoutBytes) -ceq [Convert]::ToBase64String([byte[]](10))
+            )
+            Check 'omp render decoys never ran' (-not [IO.File]::Exists($ompMarker))
+
+            # Pinned -OmpPath: the pinned exe is a counting proxy in front of the real one.
+            $ompProxyDir = New-OmpStubDirectory 'proxy' ('proxy:' + $realOmp)
+            $ompProxyExe = Join-Path $ompProxyDir 'oh-my-posh.exe'
+            $ompPinRender = Invoke-OmpInstaller $Repo $ompRenderInstall $ompRenderSettings @(
+                '-Engine', 'omp', '-OmpPath', $ompProxyExe
+            ) $ompSystemPath
+            $ompProxyLog = Join-Path $ompProxyDir 'calls.log'
+            if ([IO.File]::Exists($ompProxyLog)) { [IO.File]::Delete($ompProxyLog) }
+            $pinnedRender = Invoke-OmpRender 'cmd' (Get-OmpCommand $ompRenderInstall $ompProxyExe) $ompRenderHome $ompSystemPath $ompRenderConf
+            Check 'omp -OmpPath command renders through the pinned exe without PATH' (
+                $ompPinRender.ExitCode -eq 0 -and $pinnedRender.ExitCode -eq 0 -and
+                [Convert]::ToBase64String($pinnedRender.StdoutBytes) -ceq [Convert]::ToBase64String($ompDirectRender.StdoutBytes) -and
+                [IO.File]::Exists($ompProxyLog)
+            )
+
+            # Auto placeholder: VL_MAX_LINES 2 -> 1 replaces auto (backed up), then one row, one OMP call.
+            $ompAuto = New-Paths 'omp-auto-placeholder'
+            [void][IO.Directory]::CreateDirectory($ompAuto.Claude)
+            Write-Utf8 $ompAuto.Config ('VL_LAYOUT="auto"' + "`n" + 'VL_MAX_LINES="2"' + "`n" + 'VL_SEGMENTS="model ctx cost lines"' + "`n")
+            $ompAutoFirst = Invoke-OmpInstaller $Repo $ompAuto.Install $ompAuto.Settings
+            $ompAutoPath = Join-Path $ompAuto.Install 'coralline.auto.omp.json'
+            $ompAutoReal = Get-FileSha256 $ompAutoPath
+            Check 'omp VL_LAYOUT=auto with two lines installs a real auto config' (
+                $ompAutoFirst.ExitCode -eq 0 -and (Read-Text $ompAutoPath).Contains('"CorallineAutoTokens"')
+            )
+            Write-Utf8 $ompAuto.Config ('VL_LAYOUT="auto"' + "`n" + 'VL_MAX_LINES="1"' + "`n" + 'VL_SEGMENTS="model ctx cost lines"' + "`n")
+            $ompAutoBackupsBefore = Get-OmpBackups $ompAuto.Claude
+            $ompAutoSecond = Invoke-OmpInstaller $Repo $ompAuto.Install $ompAuto.Settings
+            $ompAutoBackupsAfter = Get-OmpBackups $ompAuto.Claude
+            $ompAutoNew = @($ompAutoBackupsAfter.Generated | Where-Object { @($ompAutoBackupsBefore.Generated) -notcontains $_ })
+            Check 'omp VL_MAX_LINES 2 -> 1 replaces auto with the placeholder and backs the old one up' (
+                $ompAutoSecond.ExitCode -eq 0 -and
+                (Read-Text $ompAutoPath).Contains('"CorallineAutoDisabled"') -and
+                $ompAutoNew.Count -eq 1 -and
+                (Get-FileSha256 (Join-Path $ompAutoNew[0] 'coralline.auto.omp.json')) -ceq $ompAutoReal -and
+                (Get-OutputText $ompAutoSecond).Contains('generated config backup retained at') -and
+                -not (Get-OutputText $ompAutoSecond).Contains('already up to date')
+            )
+            $ompAutoSingle = Join-Path $TempRoot 'omp-auto-single-row'
+            [void][IO.Directory]::CreateDirectory($ompAutoSingle)
+            foreach ($name in @('coralline.omp.json', 'coralline.float.omp.json')) {
+                [IO.File]::Copy((Join-Path $ompAuto.Install $name), (Join-Path $ompAutoSingle $name), $true)
+            }
+            $ompProxyPath = $ompProxyDir + ';' + $ompSystemPath
+            if ([IO.File]::Exists($ompProxyLog)) { [IO.File]::Delete($ompProxyLog) }
+            $autoRender = Invoke-OmpRender 'cmd' (Get-OmpCommand $ompAuto.Install) $ompAuto.Home $ompProxyPath $ompAuto.Config
+            $autoCalls = @()
+            if ([IO.File]::Exists($ompProxyLog)) { $autoCalls = @([IO.File]::ReadAllLines($ompProxyLog)) }
+            $singleArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
+                (Quote-ProcessArgument (Join-Path $ompAuto.Install 'statusline-omp.ps1')) + ' -Config ' +
+                (Quote-ProcessArgument (Join-Path $ompAutoSingle 'coralline.omp.json'))
+            $singleRender = Invoke-OmpRender 'direct' $singleArguments $ompAuto.Home $realOmpPath $ompAuto.Config
+            Check 'omp auto placeholder renders the one-row output byte for byte' (
+                $autoRender.ExitCode -eq 0 -and $null -ne $autoRender.Stdout -and $autoRender.Stdout.Contains('Fable') -and
+                [Convert]::ToBase64String($autoRender.StdoutBytes) -ceq [Convert]::ToBase64String($singleRender.StdoutBytes)
+            )
+            Check 'omp auto placeholder costs exactly one Oh-My-Posh call, on the main config' (
+                $autoCalls.Count -eq 1 -and $autoCalls[0].Contains('coralline.omp.json') -and -not $autoCalls[0].Contains('auto.omp')
+            )
+        }
+    }
+    if ($null -ne $ompSavedInputEncoding) {
+        try { [Console]::InputEncoding = $ompSavedInputEncoding } catch { }
+    }
 } finally {
     if ([IO.Directory]::Exists($TempRoot)) {
         $canonicalTemp = [IO.Path]::GetFullPath($TempRoot)

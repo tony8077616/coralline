@@ -93,6 +93,28 @@ Success means exit code `0`, a non-empty rendered statusline on stdout, and no
 error text on stderr. Tell the user to restart Claude Code or open a new session
 if the statusline does not appear immediately.
 
+### Experimental Oh-My-Posh engine (`-Engine omp`)
+
+Use it only when the user explicitly asks for the Oh-My-Posh engine; the native
+renderer stays the default. It is Windows PowerShell only (`install.sh` has no
+equivalent), and it needs Oh-My-Posh 31.3.0 or newer. See the
+[README section](README.md#oh-my-posh-engine-experimental-powershell-only).
+
+| Parameter | Meaning |
+|---|---|
+| `-Engine native\|omp` | Case-sensitive, default `native`. `omp` installs `statusline-omp.ps1` and `tools\build-omp-config.ps1` next to the native payload, generates `coralline.omp.json`, `coralline.float.omp.json` and `coralline.auto.omp.json` from `coralline.conf`, and points `statusLine` at the wrapper with `-Config`, `refreshInterval: 2`. `native` takes none of these code paths. |
+| `-OmpPath <path>` | Only with `-Engine omp`. An absolute, existing, non-reparse-point `oh-my-posh.exe`, pinned into the command as `-OmpExe`. Without it the statusline finds `oh-my-posh` on PATH at render time; use PATH mode for the MSIX (Store/winget) build. |
+
+Before writing anything, `-Engine omp` refuses `-Runtime bash`, an elevated
+(Administrator) shell, a missing or older Oh-My-Posh, and a `settings.json` it
+cannot parse. Subagent rows stay on the native `statusline.ps1 --subagent`
+command. Remote mode with `-Engine omp` downloads the wrapper and generator from
+the same commit as the rest of the payload, so `-Repo` and `-Ref` must name a
+commit that contains them; otherwise the download fails with 404 and nothing
+is changed. After the user edits `coralline.conf`, rerun the installer with
+`-Engine omp` to regenerate the configs. Rerunning without `-Engine` switches
+`statusLine` back and leaves the Oh-My-Posh files in place.
+
 ## Overview
 
 coralline is a powerline-style statusline for Claude Code. The Bash installation path

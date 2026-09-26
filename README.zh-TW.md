@@ -184,6 +184,28 @@ Bash install-only 與一般更新不會自行新增或刪除 `subagentStatusLine
 
 設定 `VL_FLOAT=1`，每次 render 都會把純文字一行寫入 `~/.claude/coralline/float.txt`。`VL_FLOAT_SEGMENTS` 預設為 `model ctx cost`。coralline 不提供 display carrier；這個檔案就是 integration seam，repo 另附一個不受支援的 [iTerm2 範例](./example/float-display-iterm2/)。設計邊界記錄在 [issue #15](https://github.com/Nanako0129/coralline/issues/15)。
 
+### Oh-My-Posh 引擎（實驗性，只支援 PowerShell）
+
+`install.ps1 -Engine omp` 改由 [Oh-My-Posh](https://ohmyposh.dev/) 繪製主狀態列，不再使用原生 renderer。需要 Oh-My-Posh 31.3.0 以上。installer 在寫入任何東西之前會先執行 `oh-my-posh version` 確認；找不到或版本太舊就停止。
+
+```powershell
+& "$PSHOME\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\install.ps1 -SourceDirectory (Get-Location).Path -InstallRoot "$HOME\.claude\coralline" -SettingsPath "$HOME\.claude\settings.json" -Engine omp
+```
+
+以上是在審核過的 checkout 內使用本機模式。遠端模式同樣接受 `-Engine omp`，會從與其他檔案相同的 commit 下載 `statusline-omp.ps1` 與 `tools\build-omp-config.ps1`，所以 `-Repo`／`-Ref` 指定的 commit 必須包含這兩個檔案。除了原生 payload，installer 會多裝這兩個檔案，並依 `coralline.conf` 在安裝根目錄產生 `coralline.omp.json`、`coralline.float.omp.json`、`coralline.auto.omp.json`。接著把 `statusLine` 指向 `statusline-omp.ps1 -Config "<安裝根目錄>\coralline.omp.json"`；在 Oh-My-Posh 引擎完成效能量測之前，`refreshInterval` 先用 `2`。明確的 `-Config` 優先於 `CORALLINE_OMP_CONFIG`。產生的檔案和 renderer 一樣受 installer 管理：內容改變時先備份，失敗時回退，完全相同的重跑不會動到它們。
+
+- **從 PATH 找 Oh-My-Posh（預設）。** 指令中不寫執行檔路徑，由 `statusline-omp.ps1` 在繪製時從 PATH 找 `oh-my-posh`，和原生 renderer 找 `git` 的方式相同。Microsoft Store／winget（MSIX）版的 `oh-my-posh.exe` 是 App Execution Alias，請用這個模式。
+- **`-OmpPath <oh-my-posh.exe 的絕對路徑>`** 以 `-OmpExe` 釘住一個執行檔。它必須是實際存在、不是 reparse point、檔名為 `oh-my-posh.exe` 的檔案，所以不能指向 App Execution Alias。沒有搭配 `-Engine omp` 時會被拒絕。
+- **修改 `coralline.conf` 後要重新產生。** 用 `-Engine omp` 重跑 installer，或自行執行 `tools\build-omp-config.ps1`，帶上 `-ConfigPath`、`-OutFile`、`-FloatOutFile`、`-AutoOutFile` 與 `-AutoPlaceholder`。`VL_SEGMENTS`、`VL_FLOAT_SEGMENTS`、風格、顏色與主題都寫死在產生的設定裡，重新產生之前會維持舊值；`VL_FLOAT_SEP` 等繪製時才讀的設定則立即生效。`VL_FLOAT=1` 使用 `coralline.float.omp.json`，這個檔案一定會產生。`VL_LAYOUT=auto` 無法產生時（`VL_NOCOLOR=1`、`VL_MAX_LINES` 為 1、背景色為空，或版面不是 auto），`coralline.auto.omp.json` 會是佔位檔，狀態列以單列固定版面呈現。
+- **設定在安裝時讀取。** installer 讀取安裝根目錄旁的 `coralline.conf`，不理會 `CORALLINE_CONFIG`；狀態列繪製時則會依 `CORALLINE_CONFIG`。環境中設有 `CORALLINE_CONFIG`、`CORALLINE_OMP_EXE` 或 `CORALLINE_OMP_CONFIG` 時，installer 會印出說明。它不會建立或修改 `coralline.conf`。
+- **Subagent 列仍由原生 renderer 繪製。** `-SubagentRows on` 寫入原生的 `statusline.ps1 --subagent` 指令，而 `statusline-omp.ps1 --subagent` 本來也會轉交給它。在 `preserve` 下，同一個安裝根目錄的 `statusline-omp.ps1 ... --subagent` 列，只有執行 `-Engine omp` 時才會改成原生列；以原生或 Bash 重跑時會保持原狀，而且仍然可以運作。
+- **只支援 PowerShell。** `install.sh` 與 Bash runtime 沒有 Oh-My-Posh 引擎，`-Engine omp -Runtime bash` 會被拒絕。`-Engine omp` 也會拒絕在提權（系統管理員）的 shell 中執行。
+- **切回原生。** 不帶 `-Engine` 重跑 `install.ps1`：`statusLine` 會改回原生或 Bash 指令，Oh-My-Posh 相關檔案留在原處，和 `statusline.sh` 的處理方式相同。
+- **Oh-My-Posh 自動更新。** 產生的設定沒有 `upgrade` 鍵，因此依賴 Oh-My-Posh 預設在繪製時不檢查、也不安裝更新。
+- **疑難排解。** 第一次安裝時如果產生器失敗，installer 會以需要「manual recovery」的錯誤停止，並保留新檔案與備份目錄；這種情況下不會動到 `settings.json`。修正回報的問題後再執行一次 installer 即可。
+
+Oh-My-Posh 引擎的效能數據尚未公布。
+
 ## 更新、重新設定與移除
 
 ### 更新

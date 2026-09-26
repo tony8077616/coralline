@@ -57,6 +57,15 @@
   or less, or when a background a token needs is the empty string: the wrapper
   falls back to the one-row fixed config in every such case.
 
+.PARAMETER AutoPlaceholder
+  With -AutoOutFile, write a placeholder auto config whenever the real one is not
+  produced, so the file always exists and always matches the current config. The
+  placeholder carries only var.CorallineGenerator and var.CorallineAutoDisabled
+  (the reason) and no blocks: statusline-omp.ps1 finds no CorallineAutoTokens or
+  CorallineAutoStyle in it and renders the one-row fixed config, with a single
+  Oh-My-Posh call. Off by default; install.ps1 -Engine omp always sets it. Without
+  it the generator writes exactly what it always has.
+
 .EXAMPLE
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\build-omp-config.ps1 -OutFile "$HOME\.claude\coralline\coralline.omp.json"
 
@@ -71,7 +80,8 @@ param(
     [string]$StatuslinePath = '',
     [string]$OutFile = '',
     [string]$FloatOutFile = '',
-    [string]$AutoOutFile = ''
+    [string]$AutoOutFile = '',
+    [switch]$AutoPlaceholder
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1209,4 +1219,21 @@ if (-not [string]::IsNullOrEmpty($FloatOutFile)) {
 if ($produceAuto -and -not [string]::IsNullOrEmpty($AutoOutFile)) {
     $autoText = (ConvertTo-CanonicalJson $autoConfig 0) + "`n"
     [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($AutoOutFile), $autoText, $Utf8NoBom)
+}
+if (-not $produceAuto -and $AutoPlaceholder -and -not [string]::IsNullOrEmpty($AutoOutFile)) {
+    # A fixed placeholder instead of no file: the installer manages all three files,
+    # so a stale auto config is replaced (and backed up) like any other managed file.
+    $autoDisabled = switch ($true) {
+        { $Cfg.VL_LAYOUT -ne 'auto' } { 'VL_LAYOUT is not auto'; break }
+        { $Cfg.VL_NOCOLOR -eq '1' } { 'VL_NOCOLOR=1'; break }
+        { $autoMaxLines -le 1 } { 'VL_MAX_LINES<=1'; break }
+        default { 'a required background is empty' }
+    }
+    $placeholder = [ordered]@{
+        '$schema' = 'https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/schema.json'
+        version = 4
+        var = [ordered]@{ CorallineGenerator = 'coralline-omp/1'; CorallineAutoDisabled = [string]$autoDisabled }
+    }
+    $placeholderText = (ConvertTo-CanonicalJson $placeholder 0) + "`n"
+    [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($AutoOutFile), $placeholderText, $Utf8NoBom)
 }

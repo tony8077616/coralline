@@ -38,6 +38,12 @@
   markers let this script trim and join the segments with VL_FLOAT_SEP. Any
   failure skips the float file silently.
 
+  --subagent: a single '--subagent' argument hands the whole call to
+  statusline.ps1's own --subagent mode in this same process, so subagent panel
+  rows always come from the native renderer, never from Oh-My-Posh. Any other
+  extra argument or unknown flag (wrong case, an extra token, a bare value)
+  prints an empty line and exits 0.
+
 .PARAMETER OmpExe
   oh-my-posh executable. Defaults to $env:CORALLINE_OMP_EXE, then PATH.
 
