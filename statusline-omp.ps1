@@ -28,7 +28,11 @@
   statusline.ps1 would hide the gauge; the burn projection goes to Oh-My-Posh as
   CORALLINE_OMP_BURN, CORALLINE_OMP_BURN_TONE and CORALLINE_OMP_BURN_ETA. If the
   state layer cannot be reused safely it is skipped: no store is read or written,
-  burn hides, and under VL_LIMIT_SYNC=1 both limit gauges hide.
+  burn hides, and under VL_LIMIT_SYNC=1 both limit gauges hide. The same happens,
+  and no float file is written, when a file this script protects (statusline.ps1,
+  this script, the generator, the configs, the Oh-My-Posh executable) has a path
+  that cannot be reduced to a drive-letter path, such as an Oh-My-Posh found on
+  PATH in a UNC folder; the statusline itself still renders.
 
   VL_FLOAT: after the statusline is written, the float file is produced the way
   statusline.ps1 produces it. The float target and its collision checks and the
@@ -858,6 +862,68 @@ function Get-OmpEnvironment {
     return @{ Payload = $payload; Env = $envMap; FhPct = $rateStrings.FhPct; FhRst = $rateStrings.FhRst; WdPct = $rateStrings.WdPct; WdRst = $rateStrings.WdRst }
 }
 
+function Get-OmpProtectedForms {
+    <#
+    .SYNOPSIS
+      Every spelling under which a file this wrapper owns can match a state path or float target; the second result says whether that set is trustworthy.
+    .DESCRIPTION
+      R1. State paths and float targets always come out of statusline.ps1's
+      ConvertTo-LocalFullPath, so they are X:\... full paths with no prefix, no
+      alternate data stream, no trailing dot or space in a component and no
+      device name. A protected path given in any other spelling (\\?\C:\...,
+      \\.\C:\..., //?/C:/..., \??\C:\...) only collides when its own
+      ConvertTo-LocalFullPath form of the real file is compared too:
+        G  [IO.Path]::GetFullPath of the path as given, the normalisation the
+           operating system applies when it opens the file ('' when it throws);
+        S  G without a leading \\?\X:\, \\.\X:\ or \??\X:\ prefix (4 characters),
+           else G;
+        C  ConvertTo-LocalFullPath of S.
+      Forms is { the path as given, its own ConvertTo-LocalFullPath, G, S, C }
+      without empty values, de-duplicated without case; it always holds the sets
+      used before R1, so ordinary paths only gain collisions.
+
+      Ok is $false when C is empty (a UNC path, \\?\UNC\, \\?\Volume{...}\,
+      \\?\GLOBALROOT\, an alternate data stream, a path GetFullPath rejects) or
+      when G still starts with \\?\ or \??\ (GetFullPath leaves those untouched)
+      and S differs from C. A caller that gets $false must fail closed: no state
+      store is read or written and no float file is written for this render.
+
+      Call it only where statusline.ps1's ConvertTo-LocalFullPath is already
+      defined (Get-OmpState after its config stage, Invoke-OmpFloat after its
+      definitions). Local names carry an omp prefix, as in Get-OmpState.
+    .PARAMETER Path
+      Protected path, as this render received or derived it.
+    .PARAMETER Ok
+      Receives $true when the forms cover the real file, else $false.
+    .EXAMPLE
+      $ok = $false; $forms = @(Get-OmpProtectedForms '\\?\C:\x\coralline.omp.json' ([ref]$ok))
+    #>
+    param([string]$Path, [ref]$Ok)
+    $Ok.Value = $false
+    $ompForms = New-Object 'System.Collections.Generic.List[string]'
+    $ompFull = ''
+    try { $ompFull = [string][System.IO.Path]::GetFullPath($Path) } catch { $ompFull = '' }
+    if ($null -eq $ompFull) { $ompFull = '' }
+    $ompStripped = $ompFull
+    if ([regex]::IsMatch($ompFull, '\A\\\\[?.]\\[A-Za-z]:\\') -or [regex]::IsMatch($ompFull, '\A\\\?\?\\[A-Za-z]:\\')) { $ompStripped = $ompFull.Substring(4) }
+    $ompCanonical = ''
+    if (-not [string]::IsNullOrEmpty($ompStripped)) { $ompCanonical = [string](ConvertTo-LocalFullPath $ompStripped ([Environment]::CurrentDirectory)) }
+    $ompNative = [string](ConvertTo-LocalFullPath $Path ([Environment]::CurrentDirectory))
+    foreach ($ompForm in @($Path, $ompNative, $ompFull, $ompStripped, $ompCanonical)) {
+        if ([string]::IsNullOrEmpty([string]$ompForm)) { continue }
+        $ompSeen = $false
+        foreach ($ompHave in $ompForms) { if ([string]::Equals($ompHave, [string]$ompForm, [System.StringComparison]::OrdinalIgnoreCase)) { $ompSeen = $true; break } }
+        if (-not $ompSeen) { [void]$ompForms.Add([string]$ompForm) }
+    }
+    $ompUnnormalised = $ompFull.StartsWith('\\?\', [System.StringComparison]::Ordinal) -or $ompFull.StartsWith('\??\', [System.StringComparison]::Ordinal)
+    $ompOk = -not [string]::IsNullOrEmpty($ompCanonical)
+    if ($ompUnnormalised -and -not [string]::Equals($ompStripped, $ompCanonical, [System.StringComparison]::OrdinalIgnoreCase)) { $ompOk = $false }
+    $Ok.Value = ($ompOk -eq $true)
+    # Unrolled on purpose: every caller collects the forms with @(), which a
+    # comma-wrapped array would survive as one nested element.
+    return [string[]]$ompForms.ToArray()
+}
+
 function Get-OmpState {
     <#
     .SYNOPSIS
@@ -870,9 +936,10 @@ function Get-OmpState {
         1. the config helpers; $HomeDir and the three quoting tables, each bound
            from its one statusline.ps1 statement and checked by type and by
            decoding a fixed word per quoting context; the defaults and the
-           config-loading statements; then the wrapper's own files are appended to
-           $ConfigVisitedPaths, so no state path (and no float target) may point at
-           them;
+           config-loading statements; then statusline.ps1 and the wrapper's own
+           files are appended to $ConfigVisitedPaths under every form
+           Get-OmpProtectedForms gives, so no state path (and no float target) may
+           point at them;
         2. the state-layer functions and Format-Eta, each defined exactly once, and
            the gate statements, matched one by one against a fixed list; the burn
            reader's row pattern, long-record pattern and Latin-1 encoding, bound
@@ -880,13 +947,17 @@ function Get-OmpState {
         3. a check of every free variable the state layer reads;
         4. the gates and Get-CorallineState, which reads and writes the stores.
       A failure in 1 returns $null. A failure in 2 or 3 leaves the stores alone and
-      reports no state. Only the wrapper's own post-processing after 4 (the burn
-      values and the synced windows) runs inside try; if it fails, burn and, under
-      VL_LIMIT_SYNC=1, both limit windows are reported absent.
+      reports no state. So does a protected path whose forms cannot be trusted
+      (R1: a UNC, \\?\Volume{...}\ or \\?\GLOBALROOT\ path, for instance), which also
+      sets ProtectedOk to $false so Invoke-OmpFloat writes no float file; the
+      result itself is still returned. Only the wrapper's own post-processing
+      after 4 (the burn values and the synced windows) runs inside try; if it
+      fails, burn and, under VL_LIMIT_SYNC=1, both limit windows are reported
+      absent.
 
       The result holds only strings, booleans, longs and string lists:
         Cfg (the float keys of the loaded config), ConfigPath, ConfigVisitedPaths,
-        FloatFileRootAuthorized, HomeDir, ScriptDir; LimitSync, FiveShow, FivePct,
+        FloatFileRootAuthorized, HomeDir, ScriptDir, ProtectedOk; LimitSync, FiveShow, FivePct,
         FiveReset, SevenShow, SevenPct, SevenReset; Burn, BurnTone, BurnEta.
     .PARAMETER FiveHourPct
       statusline.ps1's $fhPct for this payload.
@@ -970,17 +1041,22 @@ function Get-OmpState {
     $ScriptDir = Split-Path -Path $StatuslinePath -Parent
     $ScriptPath = $StatuslinePath
     . ([scriptblock]::Create([string]$ompConfigCode.Config))
-    # The wrapper's own files join the paths statusline.ps1 already protects. Only the
-    # state collision check (Get-CorallineState) and Test-FloatCollision read this
-    # array, so appending can only add collisions. Each path goes in as given and as
-    # the full path a state path resolves to. The HashSet $visited, which
-    # Import-ConfigFile uses for include cycles, is left alone.
-    if ($ConfigVisitedPaths -is [array]) {
-        foreach ($ompProtected in @($WrapperPath, $GeneratorPath, $MainConfig, $FloatConfigPath, $AutoConfigPath, $ExePath)) {
-            if ([string]::IsNullOrEmpty([string]$ompProtected)) { continue }
-            $ConfigVisitedPaths += [string]$ompProtected
-            $ompFull = ConvertTo-LocalFullPath ([string]$ompProtected) ([Environment]::CurrentDirectory)
-            if (-not [string]::IsNullOrEmpty($ompFull)) { $ConfigVisitedPaths += [string]$ompFull }
+    # The wrapper's own files, and statusline.ps1 itself (whose own $ScriptPath check
+    # keeps any \\?\ or \\.\ prefix this wrapper was started with), join the paths
+    # statusline.ps1 already protects. Only the state collision check
+    # (Get-CorallineState) and Test-FloatCollision read this array, so appending can
+    # only add collisions. Each path goes in under every form Get-OmpProtectedForms
+    # gives (R1). The HashSet $visited, which Import-ConfigFile uses for include
+    # cycles, is left alone. A path whose forms cannot be trusted closes the state
+    # layer (below, before the gates) and the float file (ProtectedOk).
+    $ompProtectedOk = $true
+    foreach ($ompProtected in @($StatuslinePath, $WrapperPath, $GeneratorPath, $MainConfig, $FloatConfigPath, $AutoConfigPath, $ExePath)) {
+        if ([string]::IsNullOrEmpty([string]$ompProtected)) { continue }
+        $ompFormsOk = $false
+        $ompProtectedForms = @(Get-OmpProtectedForms ([string]$ompProtected) ([ref]$ompFormsOk))
+        if ($ompFormsOk -ne $true) { $ompProtectedOk = $false }
+        if ($ConfigVisitedPaths -is [array]) {
+            foreach ($ompProtectedForm in $ompProtectedForms) { $ConfigVisitedPaths += [string]$ompProtectedForm }
         }
     }
 
@@ -991,6 +1067,7 @@ function Get-OmpState {
     $ompResult = @{
         Cfg = $ompFloatCfg; ConfigPath = [string]$ConfigPath; ConfigVisitedPaths = $ompVisited.ToArray()
         FloatFileRootAuthorized = ($FloatFileRootAuthorized -eq $true); HomeDir = [string]$HomeDir; ScriptDir = [string]$ScriptDir
+        ProtectedOk = ($ompProtectedOk -eq $true)
         LimitSync = $false; FiveShow = $false; FivePct = 0L; FiveReset = 0L; SevenShow = $false; SevenPct = 0L; SevenReset = 0L
         Burn = ''; BurnTone = ''; BurnEta = ''
     }
@@ -1051,6 +1128,9 @@ function Get-OmpState {
     if ($ConfigVisitedPaths -is [array]) { $ompGuard++ }
     if ($null -ne $Invariant -and $null -ne $IntegerStyle -and $null -ne $FloatStyle -and $null -ne $Utf8NoBom -and $null -ne $StrictUtf8) { $ompGuard++ }
     if ($ompGuard -ne 5) { $ompReady = $false }
+    # R1 fail-closed: a protected path whose forms cannot be trusted means no store is
+    # read or written this render (burn hides; under VL_LIMIT_SYNC=1 both limits hide).
+    if ($ompProtectedOk -ne $true) { $ompReady = $false }
 
     # ---- 4. gates and Get-CorallineState: statusline.ps1's own statements ---------------
     $ompRan = $false
@@ -1243,7 +1323,8 @@ function Invoke-OmpFloat {
       check and atomic writer are extracted from statusline.ps1 unchanged and
       evaluated here. On top of statusline.ps1's own collision set, the target may
       not be statusline.ps1, this script, the generator, either Oh-My-Posh config or
-      the Oh-My-Posh executable.
+      the Oh-My-Posh executable, under any form Get-OmpProtectedForms gives. Nothing
+      is written unless the Context's ProtectedOk is exactly $true (R1).
 
       The float config prints U+FDD0 <i> U+FDD1 before block i. The output is
       stripped of SGR and refused if any control character remains; it must hold
@@ -1267,12 +1348,14 @@ function Invoke-OmpFloat {
     .PARAMETER Environment
       The CORALLINE_OMP_* flags the main render received.
     .PARAMETER Context
-      Result of Get-OmpState; without one no float file is written.
+      Result of Get-OmpState; without one, or with ProtectedOk not $true, no float file is written.
     .EXAMPLE
       Invoke-OmpFloat -ExePath $OmpExe -MainConfig $Config -FloatConfigPath $FloatConfig -AutoConfigPath $AutoConfig -Payload $payloadBytes -Environment $envMap -Context $ompState
     #>
     param([string]$ExePath, [string]$MainConfig, [string]$FloatConfigPath, [string]$AutoConfigPath, [byte[]]$Payload, $Environment, $Context)
-    if ($null -eq $Context -or $Context.Cfg -isnot [System.Collections.IDictionary]) { return }
+    # R1 fail-closed first: anything but an explicit ProtectedOk of $true writes nothing.
+    if ($null -eq $Context -or $Context.ProtectedOk -ne $true) { return }
+    if ($Context.Cfg -isnot [System.Collections.IDictionary]) { return }
     $ast = Get-StatuslineAst
     if ($null -eq $ast) { return }
 
@@ -1322,14 +1405,16 @@ function Invoke-OmpFloat {
     $target = Get-FloatTarget
     if ([string]::IsNullOrEmpty($target)) { return }
 
-    # Explicit collision set, independent of $ScriptPath above.
+    # Explicit collision set, independent of $ScriptPath above, compared under every
+    # form Get-OmpProtectedForms gives (R1); its Ok result already closed this path
+    # through ProtectedOk above.
     $protected = @($StatuslinePath, $WrapperPath, $GeneratorPath, $MainConfig, $FloatConfigPath, $AutoConfigPath, $ExePath)
     foreach ($path in $protected) {
         if ([string]::IsNullOrEmpty([string]$path)) { continue }
-        if ($target.Equals([string]$path, [System.StringComparison]::OrdinalIgnoreCase)) { return }
-        $full = ''
-        try { $full = [System.IO.Path]::GetFullPath([string]$path) } catch { $full = '' }
-        if (-not [string]::IsNullOrEmpty($full) -and $target.Equals($full, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+        $formsOk = $false
+        foreach ($form in @(Get-OmpProtectedForms ([string]$path) ([ref]$formsOk))) {
+            if ($target.Equals([string]$form, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+        }
     }
 
     # (1) render and decode
